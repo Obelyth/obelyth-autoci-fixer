@@ -41,6 +41,9 @@ jobs:
     uses: __TOOLKIT_REPO__/.github/workflows/autofix.yml@main
     secrets: inherit
     with:
+      # The toolkit ships switched off (its `enabled` input defaults to false
+      # since 2026-09-17). Uncomment to turn it on for this repo alone.
+      # enabled: true
       max_attempts: 3
       protected_branches: __PROTECTED__
       # A fix arrives as a pull request from a fix branch. 'direct' pushes onto

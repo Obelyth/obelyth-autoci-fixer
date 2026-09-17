@@ -159,13 +159,14 @@ if [[ -n "$DIAGNOSIS" && -f "$DIAGNOSIS" ]]; then
       ran) ;;
       skipped) COULD_NOT_RUN+=("$t (skipped here)") ;;
       absent)  COULD_NOT_RUN+=("$t (did not run here)") ;;
+      *) ;;
     esac
   done < <(jq -r '.failing_tests[]?' "$DIAGNOSIS" 2>/dev/null)
 fi
 
 if (( ${#COULD_NOT_RUN[@]} )); then
   LIST="$(printf '%s; ' "${COULD_NOT_RUN[@]}" | sed 's/; $//')"
-  echo "::error::The checks pass here, but the test that was failing could not be run: $LIST. A green run that never exercised the failing test proves nothing, so nothing is pushed."
+  echo "::error::The checks pass here, but the test that was failing could not be run: $LIST. A green run that never exercised the failing test proves nothing, so nothing is pushed." >&2
   {
     echo "## Verification"
     echo

@@ -26,8 +26,8 @@ GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 ENUMERATION_CAP=5000
 
 mapfile -t ALLOWED < <(jq -r '.allowed_paths[]?' "$DIAGNOSIS" 2>/dev/null)
-allowed_has() { local a; for a in "${ALLOWED[@]}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
-any_allowed_matches() { local a; for a in "${ALLOWED[@]}"; do [[ "$a" =~ $1 ]] && return 0; done; return 1; }
+allowed_has() { local want="$1" a; for a in "${ALLOWED[@]}"; do [[ "$a" == "$want" ]] && return 0; done; return 1; }
+any_allowed_matches() { local re="$1" a; for a in "${ALLOWED[@]}"; do [[ "$a" =~ $re ]] && return 0; done; return 1; }
 
 git ls-files > "${RUNNER_TEMP}/scope-tracked.txt" 2>/dev/null || : > "${RUNNER_TEMP}/scope-tracked.txt"
 

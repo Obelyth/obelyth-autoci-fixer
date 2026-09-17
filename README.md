@@ -246,6 +246,15 @@ repo that already has one.
 
 ---
 
+## Switching it on
+
+The reusable workflow ships **switched off**: its `enabled` input defaults to
+`false` since 2026-09-17, when the fixer was turned off for cost. Every caller
+runs `autofix.yml@main`, so that one default holds the whole fleet. Turn it
+back on by flipping the default here, or by passing `enabled: true` from a
+single caller to trial it on one repo first. The daily install sweep is gated
+the same way, by the repository variable `CI_AUTOFIX_SWEEP_ENABLED`.
+
 ## What it costs, and what stops it
 
 - **About $0.40** for a complete diagnose-fix-verify-push cycle on a small repo,

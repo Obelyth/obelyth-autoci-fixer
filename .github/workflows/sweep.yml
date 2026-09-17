@@ -22,6 +22,11 @@ permissions:
 
 jobs:
   sweep:
+    # Switched off 2026-09-17 along with autofix.yml: no point installing
+    # callers that skip. Set the repository variable CI_AUTOFIX_SWEEP_ENABLED
+    # to true to turn it back on. (A literal `if: false` is what actionlint
+    # rejects as a constant condition, which is why it is a variable.)
+    if: vars.CI_AUTOFIX_SWEEP_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -17,6 +17,15 @@ name: CI Auto-Fix
 on:
   workflow_call:
     inputs:
+      enabled:
+        description: >-
+          Master switch. Off by default since 2026-09-17, when the fixer was
+          switched off for cost ("Switch off CI Auto-Fix and the install
+          sweep: too expensive"). Every caller runs autofix.yml@main, so this
+          default turns the whole fleet off at once; flip it to true here, or
+          pass enabled: true from one caller, to turn it back on.
+        type: boolean
+        default: false
       max_attempts:
         description: "Consecutive auto-fix commits or fix pull requests allowed on one branch before it is handed to a human."
         type: number
@@ -123,6 +132,7 @@ jobs:
     # failed - and since the diagnosis lives here too, nothing costs a model
     # turn unless the failure can be linked to this branch.
     if: >-
+      inputs.enabled &&
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.head_branch != ''
@@ -215,7 +225,7 @@ jobs:
 
       - name: Keep the diagnosis for the record
         if: steps.decide.outputs.proceed == 'true' && steps.diagnose.outputs.stop == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-autofix-audit
           path: |
@@ -495,7 +505,7 @@ jobs:
       - name: Upload the audit trail
         id: audit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-autofix-audit
           path: ${{ runner.temp }}/audit

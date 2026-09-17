@@ -58,6 +58,7 @@ No model was run and nothing was pushed. A failure caused by data or a checkout 
     BODY+="
 
 No model was run and nothing was pushed. When the diff cannot be connected to the failure, the honest move is to stop rather than edit whatever the log happens to mention. If the failure is flaky, re-run CI; if it is real, it belongs to an earlier change." ;;
+  *) ;;
 esac
 
 [[ -n "${VERDICT:-}" ]] && BODY+="

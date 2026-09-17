@@ -29,7 +29,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 case "$PUSH_MODE" in
   pr|direct) ;;
-  *) echo "::error::push_mode must be 'pr' or 'direct', not '$PUSH_MODE'. Nothing was pushed."
+  *) echo "::error::push_mode must be 'pr' or 'direct', not '$PUSH_MODE'. Nothing was pushed." >&2
      echo "pushed=false" >> "$GITHUB_OUTPUT"; exit 1 ;;
 esac
 
@@ -55,9 +55,9 @@ elif [[ -n "$PUSH_TOKEN" ]]; then
   echo "::warning::CI_AUTOFIX_TOKEN is set but is not shaped like a GitHub token, so it was ignored. Pushing with the built-in token instead, which will not start a new CI run."
 fi
 
-gitpush() { git "${GIT_AUTH[@]}" push "$@"; }
+gitpush() { git "${GIT_AUTH[@]}" push "$@"; return $?; }
 # gh with the push token when there is one, so the PR counts as a user's.
-ghp() { if $HAS_PUSH_TOKEN; then GH_TOKEN="$PUSH_TOKEN" gh "$@"; else gh "$@"; fi; }
+ghp() { if $HAS_PUSH_TOKEN; then GH_TOKEN="$PUSH_TOKEN" gh "$@"; else gh "$@"; fi; return $?; }
 
 SHA="$(git rev-parse HEAD)"
 echo "sha=$SHA" >> "$GITHUB_OUTPUT"
@@ -91,6 +91,7 @@ handoff_env() {
   fi
   env DIAG_CLASS="$class" DIAG_REASON="$reason" ALLOWED_PATHS="$allowed" FAILING_TESTS="$tests" \
       VERDICT="$VERDICT" VERDICT_REASON="$VERDICT_REASON" AUDIT_URL="$AUDIT_URL" "$@"
+  return $?
 }
 
 # --- Pull request: the default, and always the route for a protected branch ---
@@ -107,7 +108,7 @@ if [[ "$PUSH_MODE" == "pr" || "$PROTECTED" == "true" ]]; then
 
   if ! PR_URL="$(ghp pr create --base "$BRANCH" --head "$FIX_BRANCH" --title "$SUBJECT" --body "$PR_BODY" 2> "${RUNNER_TEMP}/pr-create.err")"; then
     ERR="$(tr '\n' ' ' < "${RUNNER_TEMP}/pr-create.err")"
-    echo "::error::The fix is on \`$FIX_BRANCH\` but the pull request could not be opened: $ERR"
+    echo "::error::The fix is on \`$FIX_BRANCH\` but the pull request could not be opened: $ERR" >&2
     mkdir -p "$AUDIT_DIR"
     [[ -s "$AUDIT_DIR/fix.diff" ]] || git diff "${BASE_SHA}..HEAD" > "$AUDIT_DIR/fix.diff"
     handoff_env FIX_RESULT=push-refused FIX_BRANCH="$FIX_BRANCH" PR_REFUSAL="$ERR" DIFF_FILE="$AUDIT_DIR/fix.diff" \
@@ -140,7 +141,7 @@ fi
 
 # --- Direct push: only with both gates green ----------------------------------
 if [[ "$VERDICT" != "APPROVE" || "$VERIFIED" != "true" ]]; then
-  echo "::error::push_mode is 'direct', which needs the second opinion to approve and verification to have run the failing test here. Got verdict='${VERDICT:-none}', verified='${VERIFIED:-false}'. Nothing was pushed."
+  echo "::error::push_mode is 'direct', which needs the second opinion to approve and verification to have run the failing test here. Got verdict='${VERDICT:-none}', verified='${VERIFIED:-false}'. Nothing was pushed." >&2
   { echo "## Not pushed"; echo; echo "Direct push needs \`VERDICT: APPROVE\` and \`verified=true\`; this run had verdict \`${VERDICT:-none}\` and verified \`${VERIFIED:-false}\`."; } >> "$GITHUB_STEP_SUMMARY"
   echo "pushed=false" >> "$GITHUB_OUTPUT"
   exit 1
