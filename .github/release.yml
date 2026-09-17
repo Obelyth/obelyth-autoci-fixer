@@ -1,0 +1,28 @@
+# GitHub's native release notes, grouped by the type/* labels PR Hygiene puts on
+# every pull request. Dependency bumps are left out. Installed by
+# Obelyth/obelyth-pr-hygiene; a release created from a v* tag uses this.
+changelog:
+  exclude:
+    labels:
+      - dependencies
+      - skip-changelog
+    authors:
+      - dependabot
+      - dependabot[bot]
+  categories:
+    - title: Features
+      labels: [type/feat]
+    - title: Fixes
+      labels: [type/fix]
+    - title: Performance
+      labels: [type/perf]
+    - title: Security
+      labels: [security]
+    - title: Refactoring
+      labels: [type/refactor]
+    - title: Documentation
+      labels: [type/docs]
+    - title: CI, tests and chores
+      labels: [type/ci, type/test, type/chore]
+    - title: Other changes
+      labels: ["*"]
