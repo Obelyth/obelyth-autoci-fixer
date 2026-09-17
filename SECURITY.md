@@ -16,6 +16,15 @@ the blast radius small on purpose:
   from a stranger cannot make it run.
 - **It cannot weaken your tests or your CI configuration.** See the guard table in
   the README. There is no override flag.
+- **It edits only what the diagnosis implicated.** Tests, workflows, manifests
+  and lockfiles are denied to the model's editing tools unless the diagnosis
+  named them, and the guard discards any change that leaves that list or grows
+  past the size caps.
+- **It does not run at all when the failure is not this branch's.** A failure
+  caused by data or a checkout the runner cannot see is classified before any
+  model starts, and stops with a comment.
+- **A second model reviews every fix read-only** and can veto it. It has no
+  editing tools and a different model from the fixer.
 
 ## Credentials
 
@@ -39,6 +48,11 @@ belong in `config.sh`, which is gitignored.
 The model reads your CI logs, and CI logs can contain text written by anyone who
 can influence a build — a dependency's output, a test fixture, a commit message.
 Assume that text is hostile.
+
+Every run uploads an audit artifact - both model transcripts, the evidence,
+the diagnosis, the deny list, the verdict and the diff. Artifacts are visible
+to anyone who can read the repository's Actions, and the transcripts contain
+whatever the models read, so treat them as you treat the repository itself.
 
 The mitigations are the guard and the permission set, not the prompt. The guard
 inspects the resulting diff mechanically and does not care what the model was

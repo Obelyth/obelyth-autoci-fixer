@@ -68,6 +68,8 @@ anything is pushed and discards the whole change if it finds:
 
 | Blocked | Why |
 |---|---|
+| Changing any file the diagnosis did not implicate | The fix is for what failed, not for whatever the log mentions |
+| More than 5 files or 150 changed lines (configurable) | A fix that wide is the wrong fix, or several; a person reads it |
 | Deleting a test file or a test case | Fewer tests is not a passing suite |
 | `.skip`, `.todo`, `xit`, `@pytest.mark.skip`, `t.Skip`, `#[ignore]`, `@Ignore` | Silencing the check that caught the problem |
 | A drop in the number of assertions | Same, one level down |
@@ -99,24 +101,79 @@ repo.
 CI fails
    │
    ├─ Triage ─────── skip checkpoint / merge-queue / dependabot branches and forks
-   │                 count auto-fix commits at the branch tip — 3 in a row and it stops
+   │                 count auto-fix commits and fix PRs — 3 and it stops
    │                 a human commit on top resets the count
-   │
    ├─ Evidence ───── the first error in context, plus the tail. Not the whole log.
+   ├─ Diagnose ───── which job and step failed, which test files the log names,
+   │                 what this branch changed, and whether the two meet
+   │                   code      → fix the source; allowed = implicated + the branch's files
+   │                   test      → fix that test only; allowed = the failing test
+   │                   env-data  → STOP: a checkout or data this runner cannot see
+   │                   unlinked  → STOP: nothing this branch changed is implicated
+   │                 (a stop posts a comment and runs no model at all)
+   │
+   ├─ Scope ──────── the allowed paths become a deny list the fixer runs under
    ├─ Fingerprint ── how many test files, test cases and assertions exist right now
    ├─ Recall ─────── what earlier attempts on this branch already tried
-   │
-   ├─ Diagnose ───── reproduce it, name the cause, fix the cause, run the whole suite
+   ├─ Fix ────────── reproduce it, name the cause, fix the cause inside the box
    │                 (no push permission, cannot rewrite history, makes one commit)
    │
-   ├─ Honesty ────── compare the diff and the fingerprint against the table above
-   ├─ Verify ─────── re-run the repo's own checks, independently of what it reported
-   ├─ Push ───────── one commit, no force. Protected branch → pull request instead.
+   ├─ Honesty ────── the diff against the table above, the scope, and the size caps
+   ├─ Second opinion  a different model, read-only, told to refute the fix
+   │                 VERDICT: APPROVE or VERDICT: REJECT — reject stops the run
+   ├─ Verify ─────── re-run the repo's checks; the failing test must have run here,
+   │                 not skipped, or the pass proves nothing and nothing is pushed
+   ├─ Audit ──────── both transcripts, diagnosis, verdict, diff → uploaded artifact
+   ├─ Push ───────── a pull request by default (`push_mode: pr`); `direct` pushes
+   │                 to the branch only with APPROVE and a verified run
    └─ Watch ─────── report how the re-run went
 ```
 
-If any stage fails, nothing is pushed and a comment explains why — on the pull
-request if there is one, otherwise a single issue per branch.
+If any stage fails, nothing is pushed and a comment explains why — with the
+diagnosis, the verdict and a link to the audit artifact — on the pull request if
+there is one, otherwise a single issue per branch.
+
+### Why diagnose first
+
+The run that shaped this: a pull request changed `lib/health.ts` and its own
+test. A separate job that checks out a private data repository failed in
+`tests/hard-router.test.ts` on the *content of a note in that repository*. The
+fixer could not read that checkout, said so in its commit message ("Nothing in
+this branch touches the router, the parser, or that note"), and rewrote the
+router test, the frontmatter test and the parser anyway — 63 turns, $4.59.
+Verification then ran the suite, the router test skipped itself for want of the
+data, and the run counted that as green.
+
+Now the diagnosis runs before any model does. That failure is `env-data`: the
+failing test is not among the branch's files, the job checks out another
+repository, and the log names a file that does not exist in this checkout. It
+stops with a comment and costs nothing.
+
+### The second opinion
+
+A fresh session on a different model reads the diagnosis, the whole diff, the
+playbook and the failing log, with `Read`, `Glob`, `Grep`, `git diff` and
+`git log` and no editing tools at all, and is told to refute the fix. It ends
+with `VERDICT: APPROVE` or `VERDICT: REJECT — <why>`; anything else — no
+verdict, no transcript — counts as reject. The fixer is `claude-opus-5` and the
+reviewer `claude-sonnet-5` by default (`fixer_model` / `reviewer_model`): a
+reviewer that shares the fixer's weights tends to find the fixer's reasoning
+persuasive, and the point of a second opinion is independent error. A read-only
+pass on the cheaper model is also a fraction of the cost.
+
+### Where the fix lands
+
+`push_mode: pr` (the default) pushes the fix to `claude/ci-autofix/<branch>-<run>`
+and opens a pull request against the failing branch with the diagnosis, the
+verdict and the audit link in its body. `push_mode: direct` pushes onto the
+branch itself, and only when the verdict is APPROVE and verification ran the
+failing test here. Protected branches always get a pull request.
+
+If GitHub refuses to open the pull request — the org or repo setting **Allow
+GitHub Actions to create and approve pull requests** is off, and there is no
+`CI_AUTOFIX_TOKEN` to open it as a user — the run does **not** fall back to a
+direct push. The fix stays on its branch, the handoff comment carries the diff
+and the `gh pr create` command, and a person opens it.
 
 ---
 
@@ -161,7 +218,15 @@ Leave the federation values empty and this is what gets used.
 **3. Optionally set `CI_AUTOFIX_TOKEN`** — a token with `repo` + `workflow` scope.
 Without it fixes still land and are still verified, but GitHub deliberately does not
 start a new CI run for a push made with the built-in `GITHUB_TOKEN`, so the green
-tick needs a manual re-run.
+tick needs a manual re-run — and a pull request opened with the built-in token
+needs the org or repo setting *Allow GitHub Actions to create and approve pull
+requests* turned on. With the token, the pull request is opened as that user
+and neither limit applies.
+
+**4. After updating this repository, refresh the callers.** `./install.sh`
+rewrites every repo's caller from `caller.template.yml`; a caller written before
+`push_mode` existed keeps working with the defaults, but only a refresh gives it
+the documented inputs.
 
 ---
 
@@ -183,7 +248,10 @@ repo that already has one.
 
 ## What it costs, and what stops it
 
-- **About $0.40** for a complete diagnose-fix-verify-push cycle on a small repo.
+- **About $0.40** for a complete diagnose-fix-verify-push cycle on a small repo,
+  plus a read-only second opinion on the cheaper model.
+- **Nothing at all** when the diagnosis stops it: `env-data` and `unlinked`
+  post a comment from the triage job and never start a model.
 - **Three attempts per branch**, then it stops and asks for a person.
 - **A human commit resets the counter**, so a branch you're actively working on is
   never starved.
@@ -243,16 +311,19 @@ config.example.sh               copy to config.sh — gitignored
 PLAYBOOK.md                     the instructions the model follows
 scripts/
   triage.sh                     should we try, and which attempt is this
-  collect-evidence.sh           first error in context, plus the tail
+  collect-evidence.sh           first error in context, plus the tail; run.json for the diagnosis
+  diagnose.sh                   class, failing tests, the branch's files, allowed_paths
+  scope-settings.sh             allowed_paths → the deny list the fixer runs under
   fingerprint.sh                counts tests and assertions
   prior-attempts.sh             what earlier attempts already tried
-  honesty-guard.sh              blocks a bought green tick
-  verify.sh                     re-runs the repo's checks independently
-  write-commit-message.sh       adds the trailers and the file list
-  push-fix.sh                   pushes, never with force
+  honesty-guard.sh              blocks a bought green tick, a change outside scope, or one too big
+  second-opinion.sh             parses the reviewer's VERDICT; anything but APPROVE stops the run
+  verify.sh                     re-runs the repo's checks; the failing test must have run
+  write-commit-message.sh       adds the trailers, the diagnosis and the verdict
+  push-fix.sh                   pull request by default; direct only with both gates green
   watch-rerun.sh                reports how the re-run went
-  handoff.sh                    explains a stop, on the PR or as an issue
-tests/guard_test.sh             tests for the guard
+  handoff.sh                    explains a stop, with the diagnosis, verdict and diff
+tests/guard_test.sh             tests for every script above that decides something
 ```
 
 Built on [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action).

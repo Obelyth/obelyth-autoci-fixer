@@ -2,7 +2,15 @@
 # Inspects the change Claude just made and fails the job if the green tick was
 # bought rather than earned. There is deliberately no override: if a fix really
 # does need a test removed or a gate relaxed, a person does that, not this robot.
+#
+# Since the diagnosis step exists, this also holds the fix to the box the
+# diagnosis drew: every changed path has to be in allowed_paths, and the whole
+# change has to fit under the size caps. The deny list the fixer ran under is
+# the polite version of the same rule; this is the one that counts.
 set -uo pipefail
+
+MAX_CHANGED_FILES="${MAX_CHANGED_FILES:-5}"
+MAX_CHANGED_LINES="${MAX_CHANGED_LINES:-150}"
 
 FAILURES=()
 note() { FAILURES+=("$1"); }
@@ -115,6 +123,34 @@ if (( after_asserts < before_asserts )); then
   note "The number of assertions fell from $before_asserts to $after_asserts. Removing the check that failed is not a fix."
 fi
 
+# --- 9. Every changed path must be inside the diagnosed scope. ----------------
+# allowed_paths is what the diagnosis implicated: the source this branch
+# changed, or the failing test this branch changed - never a test the branch
+# did not touch. No diagnosis means no scope, and no scope means no fix.
+CHANGED_PATHS="$(echo "$FILES" | awk '{ for (i = 2; i <= NF; i++) print $i }' | sort -u)"
+if [[ -n "${DIAGNOSIS:-}" && -f "$DIAGNOSIS" ]]; then
+  ALLOWED_PATHS="$(jq -r '.allowed_paths[]?' "$DIAGNOSIS" 2>/dev/null | sort -u)"
+  OUT_OF_SCOPE="$(comm -23 <(echo "$CHANGED_PATHS") <(echo "$ALLOWED_PATHS") | grep -v '^$' || true)"
+  if [[ -n "$OUT_OF_SCOPE" ]]; then
+    note "Files outside the diagnosed scope were changed. The diagnosis implicated only: $(echo "$ALLOWED_PATHS" | grep -v '^$' | paste -sd' ' || true). Out of scope:
+$(echo "$OUT_OF_SCOPE" | sed 's/^/    - /')"
+  fi
+else
+  note "No diagnosis was supplied (DIAGNOSIS is unset or missing), so there is no scope to hold the change to."
+fi
+
+# --- 10. The change must be small enough to review. --------------------------
+# A fix for one failing check is a few lines in a few files. Anything bigger is
+# either the wrong fix or several fixes, and either way a person should see it.
+n_files="$(echo "$CHANGED_PATHS" | grep -cv '^$' || true)"
+n_lines="$(git diff --numstat "$DIFF_RANGE" | awk '{ a += ($1 == "-" ? 0 : $1); d += ($2 == "-" ? 0 : $2) } END { print a + d + 0 }')"
+if (( n_files > MAX_CHANGED_FILES )); then
+  note "The fix changes $n_files files; the cap is $MAX_CHANGED_FILES. A fix that wide needs a person to read it."
+fi
+if (( n_lines > MAX_CHANGED_LINES )); then
+  note "The fix changes $n_lines lines; the cap is $MAX_CHANGED_LINES. A fix that long needs a person to read it."
+fi
+
 # --- Verdict ------------------------------------------------------------------
 {
   echo "## Honesty check"
@@ -125,6 +161,8 @@ fi
   echo "|---|---|---|"
   echo "| Test cases | $before_cases | $after_cases |"
   echo "| Assertions | $before_asserts | $after_asserts |"
+  echo "| Files changed | - | $n_files (cap $MAX_CHANGED_FILES) |"
+  echo "| Lines changed | - | $n_lines (cap $MAX_CHANGED_LINES) |"
   echo
 } >> "$GITHUB_STEP_SUMMARY"
 
@@ -143,6 +181,8 @@ if (( ${#FAILURES[@]} > 0 )); then
   exit 1
 fi
 
-echo "**Passed.** The fix changes the code under test, not the tests." >> "$GITHUB_STEP_SUMMARY"
+echo "**Passed.** The fix stays inside the diagnosed scope and changes the code under test, not the tests." >> "$GITHUB_STEP_SUMMARY"
 echo "Honesty check passed."
 echo "clean=true" >> "$GITHUB_OUTPUT"
+echo "files_changed=$n_files" >> "$GITHUB_OUTPUT"
+echo "lines_changed=$n_lines" >> "$GITHUB_OUTPUT"

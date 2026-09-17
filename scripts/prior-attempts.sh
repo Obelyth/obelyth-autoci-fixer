@@ -4,8 +4,9 @@
 # Claude Code sessions live on the runner's disk, so a later attempt lands on a
 # fresh machine with no memory of the last one. Without this, attempt two starts
 # blind and often walks straight back into attempt one's dead end. The findings
-# are already written down in two places - the commit message of an attempt that
-# pushed, and the handoff report of one that did not - so this collects both.
+# are already written down in three places - the commit message of an attempt
+# that pushed, the body of a fix pull request one opened, and the handoff report
+# of one that did not - so this collects all three.
 set -euo pipefail
 
 OUT="${RUNNER_TEMP}/prior-attempts.md"
@@ -38,6 +39,14 @@ for sha in $(git rev-list -n 10 HEAD); do
   } >> "$OUT"
   found=true
 done
+
+# --- attempts that opened a pull request: the body carries the diagnosis -----
+fix_prs="$(gh pr list --state all --limit 100 --json number,state,title,body,url 2>/dev/null \
+  | jq -c --arg m "<!-- ci-autofix-fix-for:${BRANCH}@" '[.[] | select((.body // "") | contains($m))]' 2>/dev/null || echo '[]')"
+if [[ "$(jq 'length' <<< "$fix_prs")" -gt 0 ]]; then
+  jq -r '.[] | "## Fix pull request #\(.number) (\(.state)): \(.title)\n\n\(.url)\n\n```\n\(.body | split("\n")[:40] | join("\n"))\n```\n"' <<< "$fix_prs" >> "$OUT"
+  found=true
+fi
 
 # --- attempts that were blocked: the handoff report says why -----------------
 report=""

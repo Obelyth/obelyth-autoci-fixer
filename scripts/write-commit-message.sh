@@ -14,17 +14,28 @@ BODY="$(printf '%s' "$BODY" | grep -viE '^(Co-Authored-By|Signed-off-by):' || tr
 
 FILES_CHANGED="$(git diff --name-only "${BASE_SHA}..HEAD" | sed 's/^/  /')"
 
+DIAG_LINE="not diagnosed"; DIAG_CLASS="unknown"
+if [[ -n "${DIAGNOSIS:-}" && -f "$DIAGNOSIS" ]]; then
+  DIAG_LINE="$(jq -r '"\(.class) - \(.reason)"' "$DIAGNOSIS")"
+  DIAG_CLASS="$(jq -r '.class // "unknown"' "$DIAGNOSIS")"
+fi
+
 NEW_MESSAGE="$(cat <<EOF
 ${BODY}
+
+Diagnosed as: ${DIAG_LINE}
 
 Files changed:
 ${FILES_CHANGED}
 
 Verified in the runner: ${VERIFY_SUMMARY:-not verified}
+Second opinion: ${VERDICT:-none}${REVIEWER_MODEL:+ (${REVIEWER_MODEL})}
 
 CI-Autofix-Attempt: ${ATTEMPT}/${MAX_ATTEMPTS}
 CI-Autofix-Failed-Run: ${FAILED_RUN_URL}
 CI-Autofix-Base: ${BASE_SHA}
+CI-Autofix-Class: ${DIAG_CLASS}
+CI-Autofix-Second-Opinion: ${VERDICT:-none}
 EOF
 )"
 

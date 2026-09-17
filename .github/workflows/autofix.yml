@@ -2,11 +2,15 @@ name: CI Auto-Fix
 
 # Reusable workflow. Repos call it from a thin caller file; see README.md.
 #
-# What it does: when a CI run fails, it checks out the failing branch, works out
-# the real cause, fixes it, proves the suite passes inside the runner, then pushes
-# one commit that explains what broke, why, and how it was fixed.
+# What it does: when a CI run fails, it works out what failed and whether this
+# branch can be blamed for it - before any model runs. If it can, a fixer is
+# let loose on exactly the files the diagnosis implicated and nothing else, a
+# second model reads the result with no power to change it and tries to refute
+# it, the suite is re-run here with the failing test required to have actually
+# executed, and only then is one commit pushed - by default as a pull request.
 #
-# What it will not do: weaken a test, skip a test, relax a CI gate, or force push.
+# What it will not do: weaken a test, skip a test, relax a CI gate, edit a file
+# the diagnosis did not implicate, grow past the size caps, or force push.
 # Those are blocked by scripts/honesty-guard.sh, which inspects the diff after
 # Claude finishes and fails the job rather than letting a dishonest fix through.
 
@@ -14,11 +18,11 @@ on:
   workflow_call:
     inputs:
       max_attempts:
-        description: "Consecutive auto-fix commits allowed on one branch before it is handed to a human."
+        description: "Consecutive auto-fix commits or fix pull requests allowed on one branch before it is handed to a human."
         type: number
         default: 3
       protected_branches:
-        description: "Comma-separated branches never pushed to directly. A fix for these opens a pull request instead."
+        description: "Comma-separated branches never pushed to directly. A fix for these opens a pull request whatever push_mode says."
         type: string
         default: "main,master"
       skip_branches:
@@ -29,6 +33,36 @@ on:
         description: "Ignore failures on dependabot branches."
         type: boolean
         default: true
+      push_mode:
+        description: >-
+          'pr' opens a pull request from a fix branch with the diagnosis and the
+          second opinion in its body. 'direct' pushes onto the failing branch,
+          and only when the second opinion approved and verification ran the
+          failing test here. If the platform refuses to open the pull request
+          the run hands off with the diff; it never falls back to a direct push.
+        type: string
+        default: "pr"
+      max_changed_files:
+        description: "A fix that changes more files than this is discarded."
+        type: number
+        default: 5
+      max_changed_lines:
+        description: "A fix that changes more lines (added plus removed) than this is discarded."
+        type: number
+        default: 150
+      fixer_model:
+        description: "Model that diagnoses and edits."
+        type: string
+        default: "claude-opus-5"
+      reviewer_model:
+        description: >-
+          Model that gives the second opinion. Deliberately a different model
+          from the fixer: a reviewer that shares the fixer's weights tends to
+          find the fixer's reasoning persuasive, and the point of a second
+          opinion is independent error. Sonnet 5 is also a fraction of the
+          price for a read-only pass.
+        type: string
+        default: "claude-sonnet-5"
       test_command:
         description: "Command that runs the full check suite. Empty means auto-detect from the repo."
         type: string
@@ -38,7 +72,7 @@ on:
         type: string
         default: ""
       claude_args:
-        description: "Extra arguments appended to the Claude CLI invocation."
+        description: "Extra arguments appended to the fixer's Claude CLI invocation."
         type: string
         default: ""
       autofix_repo:
@@ -85,18 +119,26 @@ jobs:
   triage:
     name: Decide whether to attempt a fix
     runs-on: ubuntu-latest
-    # Cheap gate. Nothing below costs anything unless a same-repo CI run really failed.
+    # Cheap gate. Nothing below costs anything unless a same-repo CI run really
+    # failed - and since the diagnosis lives here too, nothing costs a model
+    # turn unless the failure can be linked to this branch.
     if: >-
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.head_branch != ''
     outputs:
-      proceed: ${{ steps.decide.outputs.proceed }}
-      skip_reason: ${{ steps.decide.outputs.skip_reason }}
+      proceed: ${{ steps.decide.outputs.proceed == 'true' && steps.diagnose.outputs.stop != 'true' && 'true' || 'false' }}
+      skip_reason: ${{ steps.diagnose.outputs.stop == 'true' && steps.diagnose.outputs.reason || steps.decide.outputs.skip_reason }}
       attempt: ${{ steps.decide.outputs.attempt }}
       branch: ${{ steps.decide.outputs.branch }}
       protected: ${{ steps.decide.outputs.protected }}
       pr_number: ${{ steps.decide.outputs.pr_number }}
+      base_ref: ${{ steps.decide.outputs.base_ref }}
+      diagnosis: ${{ steps.diagnose.outputs.json }}
+      diag_class: ${{ steps.diagnose.outputs.class }}
+      diag_reason: ${{ steps.diagnose.outputs.reason }}
+      allowed_paths: ${{ steps.diagnose.outputs.allowed_paths }}
+      failing_tests: ${{ steps.diagnose.outputs.failing_tests }}
     steps:
       - name: Check out the failing branch
         uses: actions/checkout@v6
@@ -127,13 +169,69 @@ jobs:
           HAS_CLAUDE_CREDENTIAL: ${{ (secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' || inputs.anthropic_federation_rule_id != '') && 'true' || 'false' }}
         run: bash .ci-autofix/scripts/triage.sh
 
+      - name: Collect the failure evidence
+        id: evidence
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: bash .ci-autofix/scripts/collect-evidence.sh
+
+      # The diagnosis: which jobs and steps failed, which test files the log
+      # names, what this branch changed, and whether the two meet. It decides
+      # the class (code / test / env-data / unlinked) and the list of files the
+      # fixer may touch. env-data and unlinked stop right here, with a comment
+      # and no model run - which is what would have stopped the run that
+      # rewrote three test files for a failure caused by data in a private
+      # checkout it could not even read.
+      - name: Diagnose
+        id: diagnose
+        if: steps.decide.outputs.proceed == 'true'
+        env:
+          RUN_JSON: ${{ steps.evidence.outputs.run_json }}
+          RAW_LOG: ${{ steps.evidence.outputs.raw_log }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ steps.decide.outputs.base_ref }}
+          DIAGNOSIS_OUT: ${{ runner.temp }}/diagnosis.json
+        run: bash .ci-autofix/scripts/diagnose.sh
+
+      - name: Stop - this failure is not this branch's to fix
+        if: steps.decide.outputs.proceed == 'true' && steps.diagnose.outputs.stop == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.decide.outputs.branch }}
+          PR_NUMBER: ${{ steps.decide.outputs.pr_number }}
+          ATTEMPT: ${{ steps.decide.outputs.attempt }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          FIX_RESULT: ${{ steps.diagnose.outputs.class }}
+          DIAG_CLASS: ${{ steps.diagnose.outputs.class }}
+          DIAG_REASON: ${{ steps.diagnose.outputs.reason }}
+          FAILING_TESTS: ${{ steps.diagnose.outputs.failing_tests }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          FIX_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .ci-autofix/scripts/handoff.sh
+
+      - name: Keep the diagnosis for the record
+        if: steps.decide.outputs.proceed == 'true' && steps.diagnose.outputs.stop == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-autofix-audit
+          path: |
+            ${{ runner.temp }}/ci-failure.md
+            ${{ runner.temp }}/diagnosis.json
+          if-no-files-found: ignore
+
       - name: Explain a skip
-        if: steps.decide.outputs.proceed != 'true'
+        if: steps.decide.outputs.proceed != 'true' || steps.diagnose.outputs.stop == 'true'
+        env:
+          REASON: ${{ steps.diagnose.outputs.stop == 'true' && steps.diagnose.outputs.reason || steps.decide.outputs.skip_reason }}
         run: |
           {
             echo "## CI Auto-Fix did not run"
             echo
-            echo "${{ steps.decide.outputs.skip_reason }}"
+            echo "$REASON"
           } >> "$GITHUB_STEP_SUMMARY"
 
   fix:
@@ -142,6 +240,12 @@ jobs:
     if: needs.triage.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      verdict: ${{ steps.opinion.outputs.verdict }}
+      verdict_reason: ${{ steps.opinion.outputs.reason }}
+      could_not_run: ${{ steps.verify.outputs.could_not_run }}
+      audit_url: ${{ steps.audit.outputs.artifact-url }}
+      handoff_posted: ${{ steps.push.outputs.handoff_posted }}
     steps:
       - name: Check out the failing branch
         uses: actions/checkout@v6
@@ -170,6 +274,8 @@ jobs:
           # sight entirely rather than relying on nobody running `git add -A`.
           echo ".ci-autofix/" >> .git/info/exclude
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "audit=$RUNNER_TEMP/audit" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/audit"
           git config user.email "claude[bot]@users.noreply.github.com"
           git config user.name "claude[bot]"
 
@@ -180,6 +286,23 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           REPO: ${{ github.repository }}
         run: bash .ci-autofix/scripts/collect-evidence.sh
+
+      # The diagnosis made in triage, restored where the fixer, the guard and
+      # verification all read it, and turned into the deny list the fixer runs
+      # under: tests, workflows, manifests and lockfiles are off limits except
+      # the paths the diagnosis implicated.
+      - name: Restore the diagnosis and draw the box
+        id: scope
+        env:
+          DIAGNOSIS_JSON: ${{ needs.triage.outputs.diagnosis }}
+          DIAGNOSIS: .ci-autofix/diagnosis.json
+          SETTINGS_OUT: ${{ runner.temp }}/claude-settings.json
+        run: |
+          printf '%s\n' "$DIAGNOSIS_JSON" | jq . > .ci-autofix/diagnosis.json
+          cp .ci-autofix/diagnosis.json "$RUNNER_TEMP/audit/diagnosis.json"
+          cp "${{ steps.evidence.outputs.path }}" "$RUNNER_TEMP/audit/ci-failure.md"
+          bash .ci-autofix/scripts/scope-settings.sh
+          cp "$SETTINGS_OUT" "$RUNNER_TEMP/audit/claude-settings.json"
 
       - name: Take a fingerprint of the test suite
         env:
@@ -209,6 +332,10 @@ jobs:
           anthropic_service_account_id: ${{ inputs.anthropic_service_account_id }}
           anthropic_workspace_id: ${{ inputs.anthropic_workspace_id }}
           github_token: ${{ github.token }}
+          # The deny list drawn from the diagnosis. Only Edit(path) rules count
+          # for file permissions in Claude Code, and they cover Write,
+          # MultiEdit, NotebookEdit, sed -i, tee and redirects too.
+          settings: ${{ steps.scope.outputs.path }}
           prompt: |
             You are fixing a failing CI run on ${{ github.repository }}.
 
@@ -216,8 +343,22 @@ jobs:
             Failed run: ${{ github.event.workflow_run.html_url }}
             Attempt ${{ needs.triage.outputs.attempt }} of ${{ inputs.max_attempts }}.
 
+            The failure has already been diagnosed. This is your box:
+              Class:          ${{ needs.triage.outputs.diag_class }}
+              Why:            ${{ needs.triage.outputs.diag_reason }}
+              Failing tests:  ${{ needs.triage.outputs.failing_tests }}
+              You may change: ${{ needs.triage.outputs.allowed_paths }}
+            Every other file is off limits - tests, workflows, manifests and
+            lockfiles are denied to your editing tools, and the workflow checks
+            the diff afterwards: a change to any file not in that list, more
+            than ${{ inputs.max_changed_files }} files, or more than
+            ${{ inputs.max_changed_lines }} changed lines, is discarded whole.
+            If the honest fix does not fit in the box, make no commit and say
+            why. That is a good outcome.
+
             Read these files first. They are the whole job:
               .ci-autofix/PLAYBOOK.md          - how to do this honestly
+              .ci-autofix/diagnosis.json       - the diagnosis, in full
               ${{ steps.evidence.outputs.path }} - the failing jobs and their logs
               ${{ steps.prior.outputs.path }} - what earlier attempts already tried
               (the last path is empty on the first attempt - skip it then)
@@ -228,26 +369,108 @@ jobs:
             workflow and package manifest if so.)
 
             Finish by making exactly one git commit. Do not push - the workflow
-            pushes for you, after it has checked your work.
+            pushes for you, after a second model has tried to refute your fix
+            and the suite has passed here with the failing test actually run.
           claude_args: |
+            --model ${{ inputs.fixer_model }}
             --max-turns 80
             --allowedTools 'Read,Glob,Grep,Edit,MultiEdit,Write,NotebookEdit,TodoWrite,WebFetch,WebSearch,Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git restore:*),Bash(git stash:*),Bash(git rev-parse:*),Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(bun:*),Bash(node:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(uv:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*),Bash(go:*),Bash(cargo:*),Bash(make:*),Bash(swift:*),Bash(xcodebuild:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(jq:*),Bash(gh run view:*),Bash(gh run list:*),Bash(gh pr view:*),Bash(gh pr diff:*)'
             --disallowedTools 'Bash(git push:*),Bash(git reset:*),Bash(git rebase:*),Bash(git filter-branch:*),Bash(gh api:*),Bash(gh pr merge:*),Bash(gh workflow:*),Bash(gh secret:*),Bash(sudo:*),Bash(curl:*),Bash(rm -rf:*)'
             ${{ inputs.claude_args }}
 
-      - name: Check the fix is honest
+      # Both claude-code-action steps write the same execution file, so the
+      # fixer's transcript is copied aside before the reviewer overwrites it.
+      - name: Keep the fixer's transcript
+        if: always() && steps.claude.outputs.execution_file != ''
+        run: cp "${{ steps.claude.outputs.execution_file }}" "$RUNNER_TEMP/audit/claude-execution-output.json"
+
+      - name: Check the fix is honest and inside the box
         id: guard
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
           FINGERPRINT_BEFORE: ${{ runner.temp }}/fingerprint-before.json
+          DIAGNOSIS: .ci-autofix/diagnosis.json
+          MAX_CHANGED_FILES: ${{ inputs.max_changed_files }}
+          MAX_CHANGED_LINES: ${{ inputs.max_changed_lines }}
         run: bash .ci-autofix/scripts/honesty-guard.sh
 
-      - name: Prove the suite passes here
+      - name: Save the diff for review
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: git diff "${BASE_SHA}..HEAD" > "$RUNNER_TEMP/audit/fix.diff"
+
+      # A fresh session, a different model, and no way to change anything: its
+      # only job is to find the reason this fix is wrong. It reads the
+      # diagnosis, the whole diff, the playbook and the failing log, and ends
+      # with one line - VERDICT: APPROVE, or VERDICT: REJECT and one sentence.
+      - name: Second opinion
+        id: reviewer
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ inputs.anthropic_federation_rule_id == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          anthropic_api_key: ${{ inputs.anthropic_federation_rule_id == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          anthropic_federation_rule_id: ${{ inputs.anthropic_federation_rule_id }}
+          anthropic_organization_id: ${{ inputs.anthropic_organization_id }}
+          anthropic_service_account_id: ${{ inputs.anthropic_service_account_id }}
+          anthropic_workspace_id: ${{ inputs.anthropic_workspace_id }}
+          github_token: ${{ github.token }}
+          prompt: |
+            You are the second opinion on an automated CI fix for
+            ${{ github.repository }}. Another model wrote it; you did not, and
+            you cannot change it. Your job is to REFUTE it: find the reason it
+            is wrong, dishonest, out of scope, or aimed at the wrong cause.
+            Approve only if you genuinely cannot.
+
+            Read, in this order:
+              .ci-autofix/diagnosis.json        - what failed, what this branch changed, the allowed paths
+              ${{ steps.base.outputs.audit }}/fix.diff - the whole change, ${{ steps.base.outputs.sha }}..HEAD
+              .ci-autofix/PLAYBOOK.md           - the rules the fix had to follow
+              ${{ steps.evidence.outputs.path }}  - the failing jobs and their logs
+            You may also run `git diff` and `git log`, and read any file in the
+            repository.
+
+            Check, and say what you found for each:
+              1. Scope: does the diff touch only allowed_paths? Only the failing
+                 test may be edited, and only if this branch's own diff changed
+                 the behaviour it encodes.
+              2. Cause: does the change fix the cause named in the diagnosis, or
+                 a symptom? Would the failing test now pass for the right reason?
+              3. Honesty: is any assertion loosened, test removed or skipped, or
+                 gate relaxed - however it is dressed up?
+              4. Environment: could the failure be caused by data, a checkout or
+                 a secret this runner does not have, so that no code change here
+                 is the fix?
+              5. The commit message: is the stated cause supported by the log?
+
+            Be terse. End your reply with exactly one final line, nothing after it:
+              VERDICT: APPROVE
+            or
+              VERDICT: REJECT - <one sentence saying why>
+          claude_args: |
+            --model ${{ inputs.reviewer_model }}
+            --max-turns 30
+            --allowedTools 'Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)'
+            --disallowedTools 'Edit,MultiEdit,Write,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git push:*)'
+
+      - name: Parse the verdict
+        id: opinion
+        if: always() && steps.guard.outcome == 'success'
+        env:
+          EXECUTION_FILE: ${{ steps.reviewer.outputs.execution_file }}
+          VERDICT_OUT: ${{ runner.temp }}/audit/verdict.txt
+          REVIEWER_MODEL: ${{ inputs.reviewer_model }}
+        run: |
+          [[ -n "$EXECUTION_FILE" && -f "$EXECUTION_FILE" ]] && cp "$EXECUTION_FILE" "$RUNNER_TEMP/audit/reviewer-execution-output.json"
+          bash .ci-autofix/scripts/second-opinion.sh
+
+      - name: Prove the suite passes here, failing test included
         id: verify
         env:
           TEST_COMMAND: ${{ inputs.test_command }}
           SETUP_COMMAND: ${{ inputs.setup_command }}
           BASE_SHA: ${{ steps.base.outputs.sha }}
+          DIAGNOSIS: .ci-autofix/diagnosis.json
+          VERIFY_LOG: ${{ runner.temp }}/audit/verify-output.log
         run: bash .ci-autofix/scripts/verify.sh
 
       - name: Write the commit message
@@ -258,7 +481,25 @@ jobs:
           MAX_ATTEMPTS: ${{ inputs.max_attempts }}
           FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
           VERIFY_SUMMARY: ${{ steps.verify.outputs.summary }}
-        run: bash .ci-autofix/scripts/write-commit-message.sh
+          DIAGNOSIS: .ci-autofix/diagnosis.json
+          VERDICT: ${{ steps.opinion.outputs.verdict }}
+          REVIEWER_MODEL: ${{ inputs.reviewer_model }}
+        run: |
+          bash .ci-autofix/scripts/write-commit-message.sh
+          git diff "${BASE_SHA}..HEAD" > "$RUNNER_TEMP/audit/fix.diff"
+          git log -1 --format=%B > "$RUNNER_TEMP/audit/commit-message.txt"
+
+      # Everything a person needs to audit the run, whether or not it pushed:
+      # both transcripts, the evidence, the diagnosis, the deny list, the
+      # verdict, verification output and the diff.
+      - name: Upload the audit trail
+        id: audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-autofix-audit
+          path: ${{ runner.temp }}/audit
+          if-no-files-found: ignore
 
       - name: Push the fix
         id: push
@@ -269,6 +510,17 @@ jobs:
           BRANCH: ${{ needs.triage.outputs.branch }}
           PROTECTED: ${{ needs.triage.outputs.protected }}
           PR_NUMBER: ${{ needs.triage.outputs.pr_number }}
+          PUSH_MODE: ${{ inputs.push_mode }}
+          VERDICT: ${{ steps.opinion.outputs.verdict }}
+          VERDICT_REASON: ${{ steps.opinion.outputs.reason }}
+          VERIFIED: ${{ steps.verify.outputs.verified }}
+          DIAGNOSIS: .ci-autofix/diagnosis.json
+          AUDIT_URL: ${{ steps.audit.outputs.artifact-url }}
+          AUDIT_DIR: ${{ runner.temp }}/audit
+          GH_REPO: ${{ github.repository }}
+          ATTEMPT: ${{ needs.triage.outputs.attempt }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: bash .ci-autofix/scripts/push-fix.sh
 
       - name: Watch the re-run
@@ -284,7 +536,9 @@ jobs:
   handoff:
     name: Hand back to a human
     needs: [triage, fix]
-    if: always() && needs.triage.outputs.proceed == 'true' && needs.fix.result != 'success'
+    if: >-
+      always() && needs.triage.outputs.proceed == 'true' &&
+      needs.fix.result != 'success' && needs.fix.outputs.handoff_posted != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -300,7 +554,15 @@ jobs:
           PR_NUMBER: ${{ needs.triage.outputs.pr_number }}
           ATTEMPT: ${{ needs.triage.outputs.attempt }}
           MAX_ATTEMPTS: ${{ inputs.max_attempts }}
-          FIX_RESULT: ${{ needs.fix.result }}
+          FIX_RESULT: ${{ needs.fix.outputs.verdict == 'REJECT' && 'rejected' || needs.fix.result }}
+          DIAG_CLASS: ${{ needs.triage.outputs.diag_class }}
+          DIAG_REASON: ${{ needs.triage.outputs.diag_reason }}
+          FAILING_TESTS: ${{ needs.triage.outputs.failing_tests }}
+          ALLOWED_PATHS: ${{ needs.triage.outputs.allowed_paths }}
+          VERDICT: ${{ needs.fix.outputs.verdict }}
+          VERDICT_REASON: ${{ needs.fix.outputs.verdict_reason }}
+          COULD_NOT_RUN: ${{ needs.fix.outputs.could_not_run }}
+          AUDIT_URL: ${{ needs.fix.outputs.audit_url }}
           FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
           FIX_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: bash scripts/handoff.sh
