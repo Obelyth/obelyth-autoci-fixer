@@ -420,9 +420,11 @@ jobs:
           now="$(cd .ci-autofix && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
           if [[ "$now" != "$SEALED" ]]; then
             echo "::error::The auto-fix toolkit was modified while the fixer ran. The rules that judge a fix are not the fixer's to change; nothing is pushed."
-            echo "## Blocked" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
-            echo "The toolkit under \`.ci-autofix/\` no longer matches what was sealed before the fixer ran. Nothing was pushed." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Blocked"
+              echo
+              echo "The toolkit under \`.ci-autofix/\` no longer matches what was sealed before the fixer ran. Nothing was pushed."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/guard"
