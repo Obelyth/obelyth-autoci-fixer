@@ -69,7 +69,8 @@ anything is pushed and discards the whole change if it finds:
 | Blocked | Why |
 |---|---|
 | Changing any file the diagnosis did not implicate | The fix is for what failed, not for whatever the log mentions |
-| More than 5 files or 150 changed lines (configurable) | A fix that wide is the wrong fix, or several; a person reads it |
+| More than 5 files or 150 changed lines (`max_changed_files` / `max_changed_lines`) | A fix that wide is the wrong fix, or several; a person reads it |
+| Binary content in the diff | Neither reviewable nor countable against the size cap |
 | Deleting a test file or a test case | Fewer tests is not a passing suite |
 | `.skip`, `.todo`, `xit`, `@pytest.mark.skip`, `t.Skip`, `#[ignore]`, `@Ignore` | Silencing the check that caught the problem |
 | A drop in the number of assertions | Same, one level down |
@@ -118,11 +119,14 @@ CI fails
    ├─ Fix ────────── reproduce it, name the cause, fix the cause inside the box
    │                 (no push permission, cannot rewrite history, makes one commit)
    │
+   ├─ Seal ───────── the toolkit is hashed before the fixer and checked after it;
+   │                 the diagnosis is reloaded from the triage job, not the disk
    ├─ Honesty ────── the diff against the table above, the scope, and the size caps
    ├─ Second opinion  a different model, read-only, told to refute the fix
    │                 VERDICT: APPROVE or VERDICT: REJECT — reject stops the run
-   ├─ Verify ─────── re-run the repo's checks; the failing test must have run here,
-   │                 not skipped, or the pass proves nothing and nothing is pushed
+   ├─ Verify ─────── re-run the repo's checks in a clean worktree of the commit;
+   │                 the failing test must have run here, not skipped, or the
+   │                 pass proves nothing and nothing is pushed
    ├─ Audit ──────── both transcripts, diagnosis, verdict, diff → uploaded artifact
    ├─ Push ───────── a pull request by default (`push_mode: pr`); `direct` pushes
    │                 to the branch only with APPROVE and a verified run
@@ -151,11 +155,13 @@ stops with a comment and costs nothing.
 
 ### The second opinion
 
-A fresh session on a different model reads the diagnosis, the whole diff, the
-playbook and the failing log, with `Read`, `Glob`, `Grep`, `git diff` and
-`git log` and no editing tools at all, and is told to refute the fix. It ends
-with `VERDICT: APPROVE` or `VERDICT: REJECT — <why>`; anything else — no
-verdict, no transcript — counts as reject. The fixer is `claude-opus-5` and the
+A fresh session on a different model reads the diagnosis, the whole diff and
+its `git log --stat` (both rendered for it beforehand), the playbook and the
+failing log, with `Read`, `Glob` and `Grep` only — no shell, no editing tools —
+and is told to refute the fix. It ends with `VERDICT: APPROVE` or
+`VERDICT: REJECT — <why>` as its final line; anything else — no verdict, a
+verdict that is not the last line, more than one verdict, no transcript —
+counts as reject. The fixer is `claude-opus-5` and the
 reviewer `claude-sonnet-5` by default (`fixer_model` / `reviewer_model`): a
 reviewer that shares the fixer's weights tends to find the fixer's reasoning
 persuasive, and the point of a second opinion is independent error. A read-only
@@ -173,7 +179,9 @@ If GitHub refuses to open the pull request — the org or repo setting **Allow
 GitHub Actions to create and approve pull requests** is off, and there is no
 `CI_AUTOFIX_TOKEN` to open it as a user — the run does **not** fall back to a
 direct push. The fix stays on its branch, the handoff comment carries the diff
-and the `gh pr create` command, and a person opens it.
+and the `gh pr create` command, and a person opens it. If the push itself is
+refused — a protection rule, a hook, a token without write — the run reports
+exactly that, with the diff in the handoff comment, and never claims a push.
 
 ---
 

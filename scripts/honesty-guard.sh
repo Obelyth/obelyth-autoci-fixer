@@ -6,9 +6,14 @@
 # Since the diagnosis step exists, this also holds the fix to the box the
 # diagnosis drew: every changed path has to be in allowed_paths, and the whole
 # change has to fit under the size caps. The deny list the fixer ran under is
-# the polite version of the same rule; this is the one that counts.
+# the polite version of the same rule; this is the one that counts - which is
+# why the workflow hands it a diagnosis re-materialised from the triage job's
+# output, and runs it only after checking the toolkit itself is untouched.
 set -uo pipefail
 
+RUNNER_TEMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 MAX_CHANGED_FILES="${MAX_CHANGED_FILES:-5}"
 MAX_CHANGED_LINES="${MAX_CHANGED_LINES:-150}"
 
@@ -39,11 +44,26 @@ if git diff --quiet "$BASE_SHA" HEAD; then
 fi
 
 ADDED="$(git diff "$DIFF_RANGE" --unified=0 | grep -E '^\+' | grep -v '^+++' || true)"
-FILES="$(git diff "$DIFF_RANGE" --name-status || true)"
+
+# The changed paths, read NUL-separated and unquoted so that a name with a
+# space or an accent in it is one path, not two. A rename counts both its old
+# and its new name as changed.
+STATUSES=(); PATHS=()
+while IFS= read -r -d '' status; do
+  IFS= read -r -d '' path || break
+  case "$status" in
+    R*|C*)
+      IFS= read -r -d '' newpath || break
+      STATUSES+=("$status" "$status"); PATHS+=("$path" "$newpath") ;;
+    *)
+      STATUSES+=("$status"); PATHS+=("$path") ;;
+  esac
+done < <(git -c core.quotePath=false diff --name-status -z "$DIFF_RANGE")
+all_paths()     { (( ${#PATHS[@]} )) && printf '%s\n' "${PATHS[@]}"; return 0; }
+deleted_paths() { local i; for i in "${!PATHS[@]}"; do [[ "${STATUSES[i]}" == D* ]] && printf '%s\n' "${PATHS[i]}"; done; return 0; }
 
 # --- 1. Deleted test files. ---------------------------------------------------
-DELETED_TESTS="$(echo "$FILES" | awk '$1 ~ /^D/ {print $2}' \
-  | grep -Ei '(\.test\.|\.spec\.|(^|/)test_|_test\.|Tests?\.swift$|(^|/)tests?/)' || true)"
+DELETED_TESTS="$(deleted_paths | grep -Ei '(\.test\.|\.spec\.|(^|/)test_|_test\.|Tests?\.swift$|(^|/)tests?/)' || true)"
 if [[ -n "$DELETED_TESTS" ]]; then
   note "Test files were deleted:
 $(echo "$DELETED_TESTS" | sed 's/^/    - /')"
@@ -58,7 +78,7 @@ $(echo "$SKIPS" | head -20 | sed 's/^/    /')"
 fi
 
 # --- 3. CI gates relaxed. -----------------------------------------------------
-CI_TOUCHED="$(echo "$FILES" | awk '{print $NF}' | grep -E '^\.github/workflows/' || true)"
+CI_TOUCHED="$(all_paths | grep -E '^\.github/workflows/' || true)"
 if [[ -n "$CI_TOUCHED" ]]; then
   CI_ADDED="$(git diff "$DIFF_RANGE" --unified=0 -- .github/workflows/ | grep -E '^\+' | grep -v '^+++' || true)"
   CI_REMOVED="$(git diff "$DIFF_RANGE" --unified=0 -- .github/workflows/ | grep -E '^-' | grep -v '^---' || true)"
@@ -83,7 +103,7 @@ $(echo "$MANIFEST_ADDED" | grep -E '"(test|lint|typecheck|build|boundaries|check
 fi
 
 # --- 5. Local hooks disabled. -------------------------------------------------
-HOOK_FILES="$(echo "$FILES" | awk '{print $NF}' | grep -Ei 'lefthook|husky|pre-commit-config|\.githooks/' || true)"
+HOOK_FILES="$(all_paths | grep -Ei 'lefthook|husky|pre-commit-config|\.githooks/' || true)"
 if [[ -n "$HOOK_FILES" ]]; then
   note "Git hook configuration was modified ($(echo "$HOOK_FILES" | tr '\n' ' ')). Hooks are a gate, so changing them is a human decision."
 fi
@@ -96,14 +116,14 @@ $(echo "$BYPASS" | head -10 | sed 's/^/    /')"
 fi
 
 # --- 7. The toolkit must not edit itself. ------------------------------------
-if echo "$FILES" | awk '{print $NF}' | grep -q '^\.ci-autofix/'; then
+if all_paths | grep -q '^\.ci-autofix/'; then
   note "The auto-fix toolkit itself was modified. It is checked out read-only and must never appear in a fix."
 fi
 
 # The same thing by name, for the case where the repo being fixed IS the toolkit.
 # install.sh refuses to install a caller there, but a fork or a hand-written
 # caller would not know that, and a fixer that can edit its own rules has none.
-SELF="$(echo "$FILES" | awk '{print $NF}' | grep -E '(honesty-guard\.sh|guard_test\.sh|PLAYBOOK\.md|fingerprint\.sh)$' || true)"
+SELF="$(all_paths | grep -E '(honesty-guard\.sh|guard_test\.sh|PLAYBOOK\.md|fingerprint\.sh)$' || true)"
 if [[ -n "$SELF" ]]; then
   note "The fix changes the rules that judge it:
 $(echo "$SELF" | sed 's/^/    - /')"
@@ -127,7 +147,7 @@ fi
 # allowed_paths is what the diagnosis implicated: the source this branch
 # changed, or the failing test this branch changed - never a test the branch
 # did not touch. No diagnosis means no scope, and no scope means no fix.
-CHANGED_PATHS="$(echo "$FILES" | awk '{ for (i = 2; i <= NF; i++) print $i }' | sort -u)"
+CHANGED_PATHS="$(all_paths | sort -u)"
 if [[ -n "${DIAGNOSIS:-}" && -f "$DIAGNOSIS" ]]; then
   ALLOWED_PATHS="$(jq -r '.allowed_paths[]?' "$DIAGNOSIS" 2>/dev/null | sort -u)"
   OUT_OF_SCOPE="$(comm -23 <(echo "$CHANGED_PATHS") <(echo "$ALLOWED_PATHS") | grep -v '^$' || true)"
@@ -142,8 +162,15 @@ fi
 # --- 10. The change must be small enough to review. --------------------------
 # A fix for one failing check is a few lines in a few files. Anything bigger is
 # either the wrong fix or several fixes, and either way a person should see it.
+# Binary content has no line count to cap and no diff to read, so it is out.
 n_files="$(echo "$CHANGED_PATHS" | grep -cv '^$' || true)"
-n_lines="$(git diff --numstat "$DIFF_RANGE" | awk '{ a += ($1 == "-" ? 0 : $1); d += ($2 == "-" ? 0 : $2) } END { print a + d + 0 }')"
+NUMSTAT="$(git -c core.quotePath=false diff --numstat "$DIFF_RANGE")"
+n_lines="$(awk -F'\t' '{ a += ($1 == "-" ? 0 : $1); d += ($2 == "-" ? 0 : $2) } END { print a + d + 0 }' <<< "$NUMSTAT")"
+BINARY="$(awk -F'\t' '$1 == "-" || $2 == "-" { print $3 }' <<< "$NUMSTAT")"
+if [[ -n "$BINARY" ]]; then
+  note "Binary content was added or changed. A fix is text a person can read; a blob is neither reviewable nor countable against the size cap:
+$(echo "$BINARY" | sed 's/^/    - /')"
+fi
 if (( n_files > MAX_CHANGED_FILES )); then
   note "The fix changes $n_files files; the cap is $MAX_CHANGED_FILES. A fix that wide needs a person to read it."
 fi

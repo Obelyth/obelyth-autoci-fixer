@@ -328,9 +328,22 @@ jobs:
           PR_NUMBER: ${{ needs.triage.outputs.pr_number }}
         run: bash .ci-autofix/scripts/prior-attempts.sh
 
+      # The fixer can run python, node and make, and the deny list governs
+      # only its file tools - so everything on this disk is writable to it,
+      # the toolkit and the diagnosis included, and .ci-autofix/ is excluded
+      # from git's sight so a rewrite there never shows in the diff. What the
+      # fixer cannot touch is a step output the runner has already recorded.
+      # So the toolkit's content is hashed here, checked again after the fixer,
+      # and the diagnosis every later step judges by is re-materialised from
+      # the triage job's output rather than read back from the workspace.
+      - name: Seal the toolkit
+        id: seal
+        run: |
+          echo "toolkit=$(cd .ci-autofix && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
       - name: Diagnose and fix
         id: claude
-        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1 as of 2026-09-17
+        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1.0.227
         with:
           # A static credential takes precedence over federation inside the
           # action, so when a federation rule is configured these must be empty
@@ -394,20 +407,47 @@ jobs:
         if: always() && steps.claude.outputs.execution_file != ''
         run: cp "${{ steps.claude.outputs.execution_file }}" "$RUNNER_TEMP/audit/claude-execution-output.json"
 
+      # Nothing below trusts what the fixer left in the workspace. The toolkit
+      # has to hash to what it hashed to before the fixer ran, and the
+      # diagnosis the guard, the reviewer, verification, the commit message
+      # and the push all read is written fresh from the triage job's output.
+      - name: Check the toolkit is untouched and reload the diagnosis
+        id: reload
+        env:
+          SEALED: ${{ steps.seal.outputs.toolkit }}
+          DIAGNOSIS_JSON: ${{ needs.triage.outputs.diagnosis }}
+        run: |
+          now="$(cd .ci-autofix && find . -path ./.git -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          if [[ "$now" != "$SEALED" ]]; then
+            echo "::error::The auto-fix toolkit was modified while the fixer ran. The rules that judge a fix are not the fixer's to change; nothing is pushed."
+            echo "## Blocked" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "The toolkit under \`.ci-autofix/\` no longer matches what was sealed before the fixer ran. Nothing was pushed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/guard"
+          printf '%s\n' "$DIAGNOSIS_JSON" | jq . > "$RUNNER_TEMP/guard/diagnosis.json"
+          echo "diagnosis=$RUNNER_TEMP/guard/diagnosis.json" >> "$GITHUB_OUTPUT"
+
       - name: Check the fix is honest and inside the box
         id: guard
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
           FINGERPRINT_BEFORE: ${{ runner.temp }}/fingerprint-before.json
-          DIAGNOSIS: .ci-autofix/diagnosis.json
+          DIAGNOSIS: ${{ steps.reload.outputs.diagnosis }}
           MAX_CHANGED_FILES: ${{ inputs.max_changed_files }}
           MAX_CHANGED_LINES: ${{ inputs.max_changed_lines }}
         run: bash .ci-autofix/scripts/honesty-guard.sh
 
+      # The diff and the log are rendered here because the reviewer has no
+      # shell: a `git diff` it could run takes --output, and a reviewer that
+      # can write a file is not read-only.
       - name: Save the diff for review
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
-        run: git diff "${BASE_SHA}..HEAD" > "$RUNNER_TEMP/audit/fix.diff"
+        run: |
+          git diff "${BASE_SHA}..HEAD" > "$RUNNER_TEMP/audit/fix.diff"
+          git log --stat --format='commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B' "${BASE_SHA}..HEAD" > "$RUNNER_TEMP/audit/fix.log"
 
       # A fresh session, a different model, and no way to change anything: its
       # only job is to find the reason this fix is wrong. It reads the
@@ -415,7 +455,7 @@ jobs:
       # with one line - VERDICT: APPROVE, or VERDICT: REJECT and one sentence.
       - name: Second opinion
         id: reviewer
-        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1 as of 2026-09-17
+        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1.0.227
         with:
           claude_code_oauth_token: ${{ inputs.anthropic_federation_rule_id == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           anthropic_api_key: ${{ inputs.anthropic_federation_rule_id == '' && secrets.ANTHROPIC_API_KEY || '' }}
@@ -432,12 +472,13 @@ jobs:
             Approve only if you genuinely cannot.
 
             Read, in this order:
-              .ci-autofix/diagnosis.json        - what failed, what this branch changed, the allowed paths
+              ${{ steps.reload.outputs.diagnosis }} - what failed, what this branch changed, the allowed paths
               ${{ steps.base.outputs.audit }}/fix.diff - the whole change, ${{ steps.base.outputs.sha }}..HEAD
+              ${{ steps.base.outputs.audit }}/fix.log  - the commit(s) in that range, with the files each touched
               .ci-autofix/PLAYBOOK.md           - the rules the fix had to follow
               ${{ steps.evidence.outputs.path }}  - the failing jobs and their logs
-            You may also run `git diff` and `git log`, and read any file in the
-            repository.
+            You have no shell: you can read any file in the repository, but you
+            cannot run commands. The diff and the log above are rendered for you.
 
             Check, and say what you found for each:
               1. Scope: does the diff touch only allowed_paths? Only the failing
@@ -459,8 +500,8 @@ jobs:
           claude_args: |
             --model ${{ inputs.reviewer_model }}
             --max-turns 30
-            --allowedTools 'Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)'
-            --disallowedTools 'Edit,MultiEdit,Write,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git push:*)'
+            --allowedTools 'Read,Glob,Grep'
+            --disallowedTools 'Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch'
 
       - name: Parse the verdict
         id: opinion
@@ -479,7 +520,7 @@ jobs:
           TEST_COMMAND: ${{ inputs.test_command }}
           SETUP_COMMAND: ${{ inputs.setup_command }}
           BASE_SHA: ${{ steps.base.outputs.sha }}
-          DIAGNOSIS: .ci-autofix/diagnosis.json
+          DIAGNOSIS: ${{ steps.reload.outputs.diagnosis }}
           VERIFY_LOG: ${{ runner.temp }}/audit/verify-output.log
         run: bash .ci-autofix/scripts/verify.sh
 
@@ -491,7 +532,7 @@ jobs:
           MAX_ATTEMPTS: ${{ inputs.max_attempts }}
           FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
           VERIFY_SUMMARY: ${{ steps.verify.outputs.summary }}
-          DIAGNOSIS: .ci-autofix/diagnosis.json
+          DIAGNOSIS: ${{ steps.reload.outputs.diagnosis }}
           VERDICT: ${{ steps.opinion.outputs.verdict }}
           REVIEWER_MODEL: ${{ inputs.reviewer_model }}
         run: |
@@ -524,7 +565,7 @@ jobs:
           VERDICT: ${{ steps.opinion.outputs.verdict }}
           VERDICT_REASON: ${{ steps.opinion.outputs.reason }}
           VERIFIED: ${{ steps.verify.outputs.verified }}
-          DIAGNOSIS: .ci-autofix/diagnosis.json
+          DIAGNOSIS: ${{ steps.reload.outputs.diagnosis }}
           AUDIT_URL: ${{ steps.audit.outputs.artifact-url }}
           AUDIT_DIR: ${{ runner.temp }}/audit
           GH_REPO: ${{ github.repository }}

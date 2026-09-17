@@ -20,6 +20,7 @@
 # Inputs: DIAGNOSIS (path to diagnosis.json), SETTINGS_OUT (where to write).
 set -uo pipefail
 
+RUNNER_TEMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 DIAGNOSIS="${DIAGNOSIS:-.ci-autofix/diagnosis.json}"
 OUT="${SETTINGS_OUT:-${RUNNER_TEMP}/claude-settings.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
@@ -29,7 +30,7 @@ mapfile -t ALLOWED < <(jq -r '.allowed_paths[]?' "$DIAGNOSIS" 2>/dev/null)
 allowed_has() { local want="$1" a; for a in "${ALLOWED[@]}"; do [[ "$a" == "$want" ]] && return 0; done; return 1; }
 any_allowed_matches() { local re="$1" a; for a in "${ALLOWED[@]}"; do [[ "$a" =~ $re ]] && return 0; done; return 1; }
 
-git ls-files > "${RUNNER_TEMP}/scope-tracked.txt" 2>/dev/null || : > "${RUNNER_TEMP}/scope-tracked.txt"
+git -c core.quotePath=false ls-files > "${RUNNER_TEMP}/scope-tracked.txt" 2>/dev/null || : > "${RUNNER_TEMP}/scope-tracked.txt"
 
 RULES=()
 NEGATIONS=()
@@ -92,9 +93,12 @@ done
 # rules already cover sed -i and tee; these are belt and braces for the rest.
 RULES+=("Bash(git push:*)" "Bash(git reset:*)" "Bash(git rebase:*)" "Bash(git filter-branch:*)")
 
-printf '%s\n' "${RULES[@]}" "${NEGATIONS[@]}" | sort -u -s | awk '!seen[$0]++' > "${RUNNER_TEMP}/scope-rules.txt"
-# sort -u would move the negations before the rules they carve out; put them
-# back at the end, where a negation has to sit to take effect.
+# Byte order, whatever the runner's locale: a collation that ignores
+# punctuation would already sort `Edit(!x)` after `Edit(**/*.test.*)` on one
+# machine and before it on another.
+printf '%s\n' "${RULES[@]}" "${NEGATIONS[@]}" | LC_ALL=C sort -u > "${RUNNER_TEMP}/scope-rules.txt"
+# sort -u moves the negations before the rules they carve out; put them back
+# at the end, where a negation has to sit to take effect.
 {
   grep -v '^Edit(!' "${RUNNER_TEMP}/scope-rules.txt"
   grep '^Edit(!' "${RUNNER_TEMP}/scope-rules.txt" || true

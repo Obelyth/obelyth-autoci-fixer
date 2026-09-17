@@ -4,11 +4,12 @@
 # found, what stopped it, and that nothing was pushed - then gets out of the way.
 #
 # Context arrives in the environment and every piece is optional:
-#   FIX_RESULT     failure | cancelled | env-data | unlinked | rejected | push-refused
+#   FIX_RESULT     failure | cancelled | env-data | unlinked | rejected | push-refused | push-failed
 #   DIAG_CLASS, DIAG_REASON, FAILING_TESTS, ALLOWED_PATHS   from the diagnosis
 #   VERDICT, VERDICT_REASON                                 the second opinion
 #   COULD_NOT_RUN                                           from verification
 #   FIX_BRANCH, PR_REFUSAL, DIFF_FILE                       a refused pull request
+#   FIX_BRANCH, PUSH_REFUSAL, DIFF_FILE                     a refused push
 #   AUDIT_URL                                               the uploaded audit trail
 set -uo pipefail
 
@@ -25,6 +26,7 @@ case "$FIX_RESULT" in
   unlinked)     headline="CI Auto-Fix stopped: this failure could not be linked to this branch" ;;
   rejected)     headline="CI Auto-Fix stopped: the second opinion rejected the fix" ;;
   push-refused) headline="CI Auto-Fix has a fix, but could not open the pull request" ;;
+  push-failed)  headline="CI Auto-Fix has a fix, but the push was refused" ;;
   cancelled)    headline="CI Auto-Fix was cancelled" ;;
   failure)      headline="CI Auto-Fix stopped without pushing" ;;
   *)            headline="CI Auto-Fix did not complete" ;;
@@ -83,9 +85,24 @@ This is the repository or organisation setting **Allow GitHub Actions to create 
 \`\`\`
 gh pr create --repo ${GH_REPO} --base ${BRANCH} --head ${FIX_BRANCH:-}
 \`\`\`"
+fi
+
+if [[ "$FIX_RESULT" == "push-failed" ]]; then
+  BODY+="
+
+GitHub refused the push to \`${FIX_BRANCH:-}\`:
+
+\`\`\`
+${PUSH_REFUSAL:-no message}
+\`\`\`
+
+Nothing landed on any branch: the fix commit exists only in the runner that has now gone, so the diff below (and the audit trail) is the fix. A refused push is usually a branch protection rule, a required check, or a token without \`contents: write\` on \`${BRANCH}\`."
+fi
+
+if [[ "$FIX_RESULT" == push-* ]]; then
   if [[ -n "${DIFF_FILE:-}" && -s "$DIFF_FILE" ]]; then
     DIFF="$(head -c "$DIFF_CAP" "$DIFF_FILE")"
-    (( $(wc -c < "$DIFF_FILE") > DIFF_CAP )) && DIFF+=$'\n... (truncated; the full diff is on the branch and in the audit trail)'
+    (( $(wc -c < "$DIFF_FILE") > DIFF_CAP )) && DIFF+=$'\n... (truncated; the full diff is in the audit trail)'
     BODY+="
 
 <details><summary>The diff</summary>

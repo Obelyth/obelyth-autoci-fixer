@@ -16,6 +16,9 @@
 # reason to widen what the robot may do.
 set -uo pipefail
 
+RUNNER_TEMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 PUSH_MODE="${PUSH_MODE:-pr}"
 VERDICT="${VERDICT:-}"
 VERDICT_REASON="${VERDICT_REASON:-}"
@@ -56,6 +59,34 @@ elif [[ -n "$PUSH_TOKEN" ]]; then
 fi
 
 gitpush() { git "${GIT_AUTH[@]}" push "$@"; return $?; }
+
+# A push the origin rejects - a protection rule, a hook, a permission, a
+# branch that moved - is not a push. Every push here is checked, and a refused
+# one hands off with the diff, because the commit exists nowhere else.
+push_or_handoff() {  # refspec target-branch
+  local refspec="$1" target="$2" err
+  if gitpush origin "$refspec" > "${RUNNER_TEMP}/push.log" 2>&1; then
+    cat "${RUNNER_TEMP}/push.log"
+    return 0
+  fi
+  cat "${RUNNER_TEMP}/push.log"
+  err="$(grep -E '^\s*!|error:|fatal:|remote:' "${RUNNER_TEMP}/push.log" | tr '\n' ' ' | sed 's/ *$//')"
+  [[ -n "$err" ]] || err="$(tr '\n' ' ' < "${RUNNER_TEMP}/push.log")"
+  echo "::error::The push to \`$target\` was refused, so nothing landed anywhere: $err" >&2
+  mkdir -p "$AUDIT_DIR"
+  [[ -s "$AUDIT_DIR/fix.diff" ]] || git diff "${BASE_SHA}..HEAD" > "$AUDIT_DIR/fix.diff"
+  handoff_env FIX_RESULT=push-failed FIX_BRANCH="$target" PUSH_REFUSAL="$err" DIFF_FILE="$AUDIT_DIR/fix.diff" \
+    bash "$HERE/handoff.sh"
+  {
+    echo "## Not pushed"; echo
+    echo "The push to \`$target\` was refused:"
+    echo; echo '```'; echo "$err"; echo '```'; echo
+    echo "Nothing landed on any branch. The handoff comment and the audit trail carry the diff."
+  } >> "$GITHUB_STEP_SUMMARY"
+  echo "pushed=false" >> "$GITHUB_OUTPUT"
+  echo "handoff_posted=true" >> "$GITHUB_OUTPUT"
+  exit 1
+}
 # gh with the push token when there is one, so the PR counts as a user's.
 ghp() { if $HAS_PUSH_TOKEN; then GH_TOKEN="$PUSH_TOKEN" gh "$@"; else gh "$@"; fi; return $?; }
 
@@ -98,7 +129,7 @@ handoff_env() {
 if [[ "$PUSH_MODE" == "pr" || "$PROTECTED" == "true" ]]; then
   FIX_BRANCH="claude/ci-autofix/${BRANCH//\//-}-${GITHUB_RUN_ID}"
   git checkout -b "$FIX_BRANCH"
-  gitpush origin "$FIX_BRANCH"
+  push_or_handoff "$FIX_BRANCH" "$FIX_BRANCH"
 
   why="opened as a pull request rather than pushed directly, because push_mode is \`pr\`"
   [[ "$PROTECTED" == "true" ]] && why="opened as a pull request rather than pushed directly, because \`$BRANCH\` is a protected branch"
@@ -157,7 +188,7 @@ if [[ "$(git rev-parse "origin/$BRANCH")" != "$BASE_SHA" ]]; then
   exit 0
 fi
 
-gitpush origin "HEAD:$BRANCH"
+push_or_handoff "HEAD:$BRANCH" "$BRANCH"
 echo "pushed=true" >> "$GITHUB_OUTPUT"
 echo "pushed_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 

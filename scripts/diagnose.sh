@@ -26,6 +26,7 @@
 #   DIAGNOSIS_OUT  where to write the JSON (default .ci-autofix/diagnosis.json)
 set -uo pipefail
 
+RUNNER_TEMP="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 RUN_JSON="${RUN_JSON:-${RUNNER_TEMP}/run.json}"
 RAW_LOG="${RAW_LOG:-${RUNNER_TEMP}/raw.log}"
 OUT="${DIAGNOSIS_OUT:-.ci-autofix/diagnosis.json}"
@@ -37,24 +38,35 @@ GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 WORK="${RUNNER_TEMP}/diagnose"
 mkdir -p "$WORK" "$(dirname "$OUT")"
 
+# Paths come out of git as they are on disk, not quoted and escaped, so a file
+# with a space or an accent in its name can be matched against the log.
+git() { command git -c core.quotePath=false "$@"; }
+
 # What counts as a test file. Kept in step with fingerprint.sh and the guard.
 TEST_RE='(^|/)(tests?|__tests__|specs?|e2e|integration)/|\.(test|spec)\.[A-Za-z0-9]+$|(^|/)test_[^/]+\.py$|_(test|spec)\.(py|go|rb|ts|tsx|js|jsx|mjs|cjs|rs|swift|kt|java|ex|exs)$|Tests?\.swift$'
 
-# A path-looking token with a source or data extension.
-PATH_RE='(\.{0,2}/)?([]A-Za-z0-9_@.[-]+/)*[]A-Za-z0-9_@[-][]A-Za-z0-9_@.[-]*\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|rb|swift|kt|kts|java|scala|ex|exs|cs|php|c|cc|cpp|h|hpp|m|mm|sql|sh|md|json|ya?ml|toml|cfg|ini|txt|csv)'
+# A path-looking token with a source or data extension. [:alpha:] rather than
+# A-Za-z so that a file named in another alphabet is still a path.
+PATH_RE='(\.{0,2}/)?([][:alpha:]0-9_@.[-]+/)*[][:alpha:]0-9_@[-][][:alpha:]0-9_@.[-]*\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|rb|swift|kt|kts|java|scala|ex|exs|cs|php|c|cc|cpp|h|hpp|m|mm|sql|sh|md|json|ya?ml|toml|cfg|ini|txt|csv)'
 
 # Lines worth pulling paths out of: a failure, or a file:line reference.
 INTEREST_RE='FAIL|ERROR|Error|error|panicked|Assertion|assert|Traceback|Exception|Expected|expected|×|✗|✘|❯|##\[error\]|:[0-9]+(:[0-9]+)?([^0-9]|$)|\([0-9]+,[0-9]+\)|", line [0-9]+'
 # Lines that report a pass, which are never evidence of a failure even when
 # the test's own name happens to contain the word "error".
 PASS_LINE_RE='^[[:space:]]*(✓|√|PASS([[:space:]]|$)|ok([[:space:]]|$)|passed|PASSED|\[ *OK *\])'
-# Directories whose contents are never the cause and never "missing".
-NOISE_RE='(^|/)(node_modules|\.git|\.pnpm|\.yarn|\.venv|venv|site-packages|__pycache__|dist|build|out|coverage|target|\.next|\.cache|\.turbo|vendor|\.ci-autofix)/|^(internal|node|deps|usr|etc|opt|proc|tmp|home|lib64|snap)/'
+# Directories whose contents are never the cause and never "missing". Go's
+# internal/ is a source directory, so it is not here; node's internal/*.js
+# stack frames are handled below, where a path that does not exist is judged.
+NOISE_RE='(^|/)(node_modules|\.git|\.pnpm|\.yarn|\.venv|venv|site-packages|__pycache__|dist|build|out|coverage|target|\.next|\.cache|\.turbo|vendor|\.ci-autofix)/|^(node|deps|usr|etc|opt|proc|tmp|home|lib64|snap)/'
+# A path that does not exist here but is not a sign of missing data either:
+# node's own internals, printed by older runtimes in every stack trace.
+MISSING_NOISE_RE='^internal/.*\.(js|mjs|cjs)$|^node:'
 
 is_test() { [[ "$1" =~ $TEST_RE ]]; }
 
-# Set helpers over sorted, one-per-line files.
-sorted() { grep -v '^$' "$1" 2>/dev/null | sort -u; }
+# Set helpers over sorted, one-per-line files. sorted takes any number of
+# files and returns their union.
+sorted() { cat -- "$@" 2>/dev/null | grep -v '^$' | sort -u; }
 inter()  { comm -12 <(sorted "$1") <(sorted "$2"); }
 minus()  { comm -23 <(sorted "$1") <(sorted "$2"); }
 lines()  { grep -cv '^$' "$1" 2>/dev/null || true; }
@@ -76,9 +88,11 @@ jq -r '.[].steps[]' <<< "$FAILED_JOBS" > "$WORK/failed-step-names.txt"
 # --- 2. The log, made readable -------------------------------------------------
 # Strip colour codes, the "job<TAB>step<TAB>" prefix gh puts on --log-failed
 # output, the timestamp, and URLs (a docs link is not a file in this repo).
+# A ##[error] annotation is split from whatever follows it, so the path after
+# it is read as a path and not as "[error]path".
 CLEAN="$WORK/log.txt"
 if [[ -f "$RAW_LOG" ]]; then
-  sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[^\t]*\t[^\t]*\t//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//; s#[a-z]+://[^[:space:]]+##g' \
+  sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[^\t]*\t[^\t]*\t//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//; s#[a-z]+://[^[:space:]]+##g; s/(##\[[a-z]+\])/\1 /g' \
     "$RAW_LOG" > "$CLEAN"
 else
   : > "$CLEAN"
@@ -97,6 +111,8 @@ resolve_path() {
   tok="${tok#./}"
   tok="$(sed -E 's#^/home/runner/work/[^/]+/[^/]+/##; s#^/github/workspace/##' <<< "$tok")"
   [[ "$tok" == /* ]] && return 1
+  # Nothing outside the checkout is a file in it, whatever the runner prints.
+  [[ "$tok" == ../* || "$tok" == */../* ]] && return 1
   [[ "$tok" =~ $NOISE_RE ]] && return 1
   if [[ -f "$tok" ]]; then echo "$tok"; return 0; fi
   local hits
@@ -115,30 +131,69 @@ while IFS= read -r line; do
       echo "$p" >> "$WORK/named-existing.txt"
       is_test "$p" && echo "$p" >> "$WORK/failing-tests.txt"
     elif [[ "$tok" == */* && ! "$tok" =~ $NOISE_RE && "$tok" != /* ]]; then
-      echo "${tok#./}" >> "$WORK/named-missing.txt"
+      tok="${tok#./}"
+      [[ "$tok" =~ $MISSING_NOISE_RE ]] || echo "$tok" >> "$WORK/named-missing.txt"
     fi
   done < <(grep -oE "$PATH_RE" <<< "$line" || true)
 done < "$CLEAN"
 
+# The failing cases by name, where the runner prints them: vitest's
+# "FAIL file > suite > name", jest's "FAIL file" followed by "● suite › name",
+# pytest's "FAILED file::name". Verification uses these to tell a file that
+# ran from a file whose failing case was the one that skipped itself.
+CASES="$WORK/failing-cases.tsv"; : > "$CASES"
+VITEST_CASE_RE='(^|[[:space:]])FAIL[[:space:]]+([^[:space:]]+)[[:space:]]+>[[:space:]]+(.+)$'
+JEST_FILE_RE='(^|[[:space:]])FAIL[[:space:]]+([^[:space:]]+)[[:space:]]*$'
+JEST_CASE_RE='^[[:space:]]*●[[:space:]]+(.+)$'
+PYTEST_CASE_RE='FAILED[[:space:]]+([^[:space:]:]+)::([^[:space:]]+)'
+record_case() {  # raw file token, case name
+  local f n="$2"
+  f="$(resolve_path "$1")" || return 0
+  is_test "$f" || return 0
+  n="$(sed -E 's/[[:space:]]+$//' <<< "$n")"
+  [[ -n "$n" ]] && printf '%s\t%s\n' "$f" "$n" >> "$CASES"
+}
+jest_file=""
+while IFS= read -r line; do
+  if [[ "$line" =~ $VITEST_CASE_RE ]]; then
+    n="${BASH_REMATCH[3]}"; record_case "${BASH_REMATCH[2]}" "${n##* > }"; jest_file=""
+  elif [[ "$line" =~ $JEST_FILE_RE ]]; then
+    jest_file="${BASH_REMATCH[2]}"
+  elif [[ -n "$jest_file" && "$line" =~ $JEST_CASE_RE ]]; then
+    n="${BASH_REMATCH[1]}"
+    [[ "$n" == "Test suite failed to run"* ]] || record_case "$jest_file" "${n##* › }"
+  elif [[ "$line" =~ $PYTEST_CASE_RE ]]; then
+    record_case "${BASH_REMATCH[1]}" "${BASH_REMATCH[1]}::${BASH_REMATCH[2]}"
+  elif [[ "$line" =~ ^[[:space:]]*(PASS|✓|√)[[:space:]] ]]; then
+    jest_file=""
+  fi
+done < "$CLEAN"
+sort -u -o "$CASES" "$CASES"
+
 # --- 4. This branch's own diff -------------------------------------------------
 PR_BASE=""
-: > "$WORK/pr-files.txt"
+: > "$WORK/pr-files.txt"; : > "$WORK/pr-gone.txt"
 BASE_NOTE=""
 if [[ -n "$BASE_REF" ]]; then
   for cand in "origin/$BASE_REF" "$BASE_REF"; do
     if git rev-parse --verify -q "$cand^{commit}" >/dev/null 2>&1; then PR_BASE="$cand"; break; fi
   done
 fi
+DIFF_FROM=""
 if [[ -n "$PR_BASE" ]]; then
   mb="$(git merge-base "$PR_BASE" HEAD 2>/dev/null || true)"
   if [[ -n "$mb" && "$mb" != "$(git rev-parse HEAD)" ]]; then
-    git diff --name-only "$mb" HEAD > "$WORK/pr-files.txt" 2>/dev/null
+    DIFF_FROM="$mb"
   else
     # HEAD is the base itself - a failure on the default branch. The only
     # change that can be blamed is the commit that just landed.
-    git diff --name-only HEAD~1 HEAD > "$WORK/pr-files.txt" 2>/dev/null
+    DIFF_FROM="HEAD~1"
     BASE_NOTE="HEAD is $PR_BASE itself, so the last commit stands in for the branch diff"
   fi
+  git diff --name-only "$DIFF_FROM" HEAD > "$WORK/pr-files.txt" 2>/dev/null
+  # Paths this branch deleted or renamed away: a module the log cannot find
+  # may be one of these, and then the diff is the direct cause.
+  git diff --name-status --diff-filter=DR "$DIFF_FROM" HEAD 2>/dev/null | awk -F'\t' 'NF >= 2 { print $2 }' > "$WORK/pr-gone.txt"
 else
   BASE_NOTE="base ref '${BASE_REF:-<none>}' could not be resolved, so the branch's own diff is unknown"
 fi
@@ -148,8 +203,8 @@ sorted "$WORK/pr-files.txt" | grep -E  "$TEST_RE" > "$WORK/pr-tests.txt" || true
 # --- 5. What the failing job reads ---------------------------------------------
 # The block for the failing job is cut out of the workflow file and searched for
 # a checkout of some other repository and for the markers that mean "this job
-# needs data from outside": BRAIN_DIR, corpus, gate, e2e. actions/checkout also
-# announces the repository it syncs, so the log is checked for that too.
+# needs data from outside": BRAIN_DIR, corpus, gate, e2e, as whole words. actions/checkout
+# also announces the repository it syncs, so the log is checked for that too.
 OTHER_REPO=""
 : > "$WORK/markers.txt"
 JOB_BLOCK_FOUND=false
@@ -197,11 +252,16 @@ fi
 if [[ -s "$BLOCK" ]]; then
   while IFS= read -r r; do
     [[ -z "$r" || "$r" == *'github.repository'* ]] && continue
+    # An expression cannot be evaluated here. The usual one names the head
+    # repository of a fork pull request, which is not "another repository";
+    # either way it is unknown, not foreign.
+    [[ "$r" == *'${{'* ]] && continue
     [[ "${r,,}" == "${REPO,,}" ]] && continue
     OTHER_REPO="$r"; break
   done < <(grep -oE 'repository:[[:space:]]*["'"'"']?[^"'"'"'[:space:]]+' "$BLOCK" | sed -E 's/^repository:[[:space:]]*["'"'"']?//')
+  # Whole words only: "brain-gate" carries a gate, "Aggregate coverage" does not.
   { cat "$BLOCK" "$WORK/failed-job-names.txt" "$WORK/failed-step-names.txt"; } \
-    | grep -oiE 'BRAIN_DIR|corpus|gate|e2e' | tr '[:upper:]' '[:lower:]' | sort -u > "$WORK/markers.txt"
+    | grep -oiwE 'BRAIN_DIR|corpus|gate|e2e' | tr '[:upper:]' '[:lower:]' | sort -u > "$WORK/markers.txt"
 fi
 if [[ -z "$OTHER_REPO" ]]; then
   while IFS= read -r r; do
@@ -276,7 +336,7 @@ for ((depth = 1; depth <= IMPORT_DEPTH; depth++)); do
   [[ -s "$WORK/frontier.txt" ]] || break
   head -n "$FRONTIER_CAP" "$WORK/frontier.txt" > "$WORK/frontier-capped.txt"
   while IFS= read -r f; do imports_of "$f"; done < "$WORK/frontier-capped.txt" | sort -u > "$WORK/found.txt"
-  minus "$WORK/found.txt" <(sorted "$WORK/reach.txt" "$WORK/seeds.txt" | sort -u) > "$WORK/next.txt"
+  minus "$WORK/found.txt" <(sorted "$WORK/reach.txt" "$WORK/seeds.txt") > "$WORK/next.txt"
   cat "$WORK/next.txt" >> "$WORK/reach.txt"
   cp "$WORK/next.txt" "$WORK/frontier.txt"
 done
@@ -286,6 +346,27 @@ inter "$WORK/named-existing.txt" "$WORK/pr-src.txt"   > "$WORK/direct-src.txt"
 cat "$WORK/failing-tests.txt" "$WORK/named-existing.txt" | inter /dev/stdin "$WORK/pr-tests.txt" > "$WORK/direct-tests.txt"
 inter "$WORK/reach.txt" "$WORK/pr-src.txt" | minus /dev/stdin "$WORK/direct-src.txt" > "$WORK/reach-src.txt"
 inter "$WORK/failing-tests.txt" "$WORK/pr-files.txt" > "$WORK/intersection.txt"
+
+# A module the log cannot find that this branch deleted or renamed away is
+# the one case where a missing path is the diff's own doing. Matched on the
+# basename without its extension, since TypeScript reports './helpers.js' for
+# a file called helpers.ts. Such a token is explained, not an environment
+# signal, and the files that import it are implicated source.
+: > "$WORK/gone-hit.txt"; : > "$WORK/missing-explained.txt"
+if [[ -s "$WORK/named-missing.txt" && -s "$WORK/pr-gone.txt" ]]; then
+  while IFS= read -r miss; do
+    stem="$(basename "$miss")"; stem="${stem%.*}"
+    while IFS= read -r gone; do
+      gstem="$(basename "$gone")"; gstem="${gstem%.*}"
+      if [[ -n "$stem" && "$stem" == "$gstem" ]]; then
+        echo "$gone" >> "$WORK/gone-hit.txt"; echo "$miss" >> "$WORK/missing-explained.txt"
+      fi
+    done < <(sorted "$WORK/pr-gone.txt")
+  done < <(sorted "$WORK/named-missing.txt")
+  minus "$WORK/named-missing.txt" "$WORK/missing-explained.txt" > "$WORK/named-missing.tmp"
+  mv "$WORK/named-missing.tmp" "$WORK/named-missing.txt"
+fi
+sorted "$WORK/named-existing.txt" | grep -Ev "$TEST_RE" > "$WORK/named-src.txt" || true
 
 STRONG_ENV=false; [[ -n "$OTHER_REPO" || -s "$WORK/named-missing.txt" ]] && STRONG_ENV=true
 WEAK_ENV=false;   [[ -s "$WORK/markers.txt" ]] && WEAK_ENV=true
@@ -303,17 +384,24 @@ describe_env() {
   echo "$out"
 }
 
+# code: the implicated source, what reaches it, and the branch's own files.
+# test: the failing test this branch changed, and nothing else - never a test
+#       the branch did not touch, however many the log names.
 if [[ -s "$WORK/direct-src.txt" ]]; then
   CLASS="code"
-  sorted "$WORK/direct-src.txt" "$WORK/reach-src.txt" "$WORK/pr-files.txt" | sort -u > "$WORK/allowed.txt"
+  sorted "$WORK/direct-src.txt" "$WORK/reach-src.txt" "$WORK/pr-files.txt" > "$WORK/allowed.txt"
   REASON="the log names source this branch changed ($(joined "$WORK/direct-src.txt"))"
+elif [[ -s "$WORK/gone-hit.txt" ]]; then
+  CLASS="code"
+  sorted "$WORK/gone-hit.txt" "$WORK/named-src.txt" "$WORK/reach-src.txt" "$WORK/pr-files.txt" > "$WORK/allowed.txt"
+  REASON="the log reports a module this branch deleted or renamed as missing ($(joined "$WORK/missing-explained.txt") ~ $(joined "$WORK/gone-hit.txt"))"
 elif [[ -s "$WORK/reach-src.txt" ]] && ! $STRONG_ENV; then
   CLASS="code"
-  sorted "$WORK/reach-src.txt" "$WORK/pr-files.txt" | sort -u > "$WORK/allowed.txt"
+  sorted "$WORK/reach-src.txt" "$WORK/pr-files.txt" > "$WORK/allowed.txt"
   REASON="the failing files import source this branch changed ($(joined "$WORK/reach-src.txt"))"
 elif [[ -s "$WORK/direct-tests.txt" ]]; then
   CLASS="test"
-  sorted "$WORK/failing-tests.txt" "$WORK/direct-tests.txt" | sort -u > "$WORK/allowed.txt"
+  sorted "$WORK/direct-tests.txt" > "$WORK/allowed.txt"
   REASON="the only implicated files are tests this branch changed ($(joined "$WORK/direct-tests.txt"))"
 elif $STRONG_ENV || $WEAK_ENV; then
   CLASS="env-data"; STOP=true
@@ -325,29 +413,38 @@ fi
 [[ -n "$BASE_NOTE" ]] && REASON="$REASON; $BASE_NOTE"
 
 # --- 8. Write it down ----------------------------------------------------------
+FAILING_CASES='[]'
+if [[ -s "$CASES" ]]; then
+  FAILING_CASES="$(jq -R 'split("\t") | {file: .[0], name: .[1]}' "$CASES" | jq -sc .)"
+fi
+
 jq -n \
   --arg class "$CLASS" --argjson stop "$STOP" --arg reason "$REASON" \
   --argjson failed_jobs "$FAILED_JOBS" \
   --argjson failing_tests "$(as_json_array "$WORK/failing-tests.txt")" \
+  --argjson failing_cases "$FAILING_CASES" \
   --argjson log_named_files "$(as_json_array "$WORK/named-existing.txt")" \
   --argjson log_named_missing "$(as_json_array "$WORK/named-missing.txt")" \
   --arg pr_base "${PR_BASE:-}" --arg base_note "$BASE_NOTE" \
   --argjson pr_files "$(as_json_array "$WORK/pr-files.txt")" \
+  --argjson pr_deleted "$(as_json_array "$WORK/pr-gone.txt")" \
   --argjson intersection "$(as_json_array "$WORK/intersection.txt")" \
   --argjson implicated_source "$(as_json_array "$WORK/direct-src.txt")" \
   --argjson reachable_source "$(as_json_array "$WORK/reach-src.txt")" \
   --argjson implicated_tests "$(as_json_array "$WORK/direct-tests.txt")" \
+  --argjson deleted_modules "$(as_json_array "$WORK/gone-hit.txt")" \
   --arg other_repository "$OTHER_REPO" \
   --argjson markers "$(as_json_array "$WORK/markers.txt")" \
   --argjson job_block_found "$JOB_BLOCK_FOUND" \
   --arg workflow "$WORKFLOW_PATH" \
   --argjson allowed_paths "$(as_json_array "$WORK/allowed.txt")" \
   '{class: $class, stop: $stop, reason: $reason,
-    failed_jobs: $failed_jobs, failing_tests: $failing_tests,
+    failed_jobs: $failed_jobs, failing_tests: $failing_tests, failing_cases: $failing_cases,
     log_named_files: $log_named_files, log_named_missing: $log_named_missing,
-    pr_base: $pr_base, base_note: $base_note, pr_files: $pr_files,
+    pr_base: $pr_base, base_note: $base_note, pr_files: $pr_files, pr_deleted: $pr_deleted,
     intersection: $intersection, implicated_source: $implicated_source,
     reachable_source: $reachable_source, implicated_tests: $implicated_tests,
+    deleted_modules: $deleted_modules,
     env: {other_repository: $other_repository, markers: $markers,
           job_block_found: $job_block_found, workflow: $workflow},
     allowed_paths: $allowed_paths}' > "$OUT"
