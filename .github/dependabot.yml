@@ -1,0 +1,9 @@
+# Keeps the commit-SHA pins in .github/workflows current. The actions this
+# toolkit runs are pinned to full commit SHAs (a tag can be moved; a SHA
+# cannot), which is only safe to live with if something proposes the bumps.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

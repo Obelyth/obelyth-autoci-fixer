@@ -330,7 +330,7 @@ jobs:
 
       - name: Diagnose and fix
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1 as of 2026-09-17
         with:
           # A static credential takes precedence over federation inside the
           # action, so when a federation rule is configured these must be empty
@@ -415,7 +415,7 @@ jobs:
       # with one line - VERDICT: APPROVE, or VERDICT: REJECT and one sentence.
       - name: Second opinion
         id: reviewer
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1 as of 2026-09-17
         with:
           claude_code_oauth_token: ${{ inputs.anthropic_federation_rule_id == '' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           anthropic_api_key: ${{ inputs.anthropic_federation_rule_id == '' && secrets.ANTHROPIC_API_KEY || '' }}
