@@ -151,14 +151,14 @@ jobs:
       failing_tests: ${{ steps.diagnose.outputs.failing_tests }}
     steps:
       - name: Check out the failing branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_branch }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Load the auto-fix toolkit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.autofix_repo }}
           ref: ${{ inputs.autofix_ref }}
@@ -258,7 +258,7 @@ jobs:
       handoff_posted: ${{ steps.push.outputs.handoff_posted }}
     steps:
       - name: Check out the failing branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.triage.outputs.branch }}
           fetch-depth: 0
@@ -270,7 +270,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Load the auto-fix toolkit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.autofix_repo }}
           ref: ${{ inputs.autofix_ref }}
@@ -594,7 +594,7 @@ jobs:
       needs.fix.result != 'success' && needs.fix.outputs.handoff_posted != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ inputs.autofix_repo }}
           ref: ${{ inputs.autofix_ref }}
