@@ -1,0 +1,11 @@
+# Keeps the commit-SHA pins in .github/workflows current. The third-party
+# actions the autofix pipeline added are pinned to full commit SHAs (a tag can
+# be moved; a SHA cannot), which is only safe to live with if something
+# proposes the bumps. actions/checkout is still on its major tag; dependabot
+# moves that too.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

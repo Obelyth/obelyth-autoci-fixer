@@ -9,12 +9,23 @@
 set -euo pipefail
 
 EVIDENCE="${RUNNER_TEMP}/ci-failure.md"
+RUN_JSON="${RUNNER_TEMP}/run.json"
+RAW_LOG="${RUNNER_TEMP}/raw.log"
 CONTEXT_LINES=40   # window around the first error, for the cause
 TAIL_LINES=120     # end of the log, for the consequences
 MAX_BYTES=60000    # hard ceiling on the whole file
 
 # Lines that usually mark the real failure rather than its fallout.
 ERROR_RE='(^|[^a-zA-Z])(error|fatal|failed|failure|exception|panic|traceback|assert|cannot|unable to|not found|undefined|unresolved|refused|denied|timed out)([^a-zA-Z]|$)|^[[:space:]]*(FAIL|ERR)|##\[error\]'
+
+# The run's metadata and its jobs and steps, kept whole for the diagnosis step:
+# which job failed, which step, and which workflow file defines it.
+{
+  gh api "repos/$REPO/actions/runs/$RUN_ID" 2>/dev/null || echo '{}'
+  gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" 2>/dev/null || echo '{"jobs":[]}'
+} | jq -s '.[0] + {jobs: (.[1].jobs // [])}' > "$RUN_JSON" 2>/dev/null || echo '{}' > "$RUN_JSON"
+echo "run_json=$RUN_JSON" >> "$GITHUB_OUTPUT"
+echo "raw_log=$RAW_LOG" >> "$GITHUB_OUTPUT"
 
 {
   echo "# Failing CI run"
@@ -38,17 +49,18 @@ ERROR_RE='(^|[^a-zA-Z])(error|fatal|failed|failure|exception|panic|traceback|ass
   echo
 } > "$EVIDENCE"
 
-if ! gh run view "$RUN_ID" --repo "$REPO" --log-failed > "${RUNNER_TEMP}/raw.log" 2>/dev/null; then
+if ! gh run view "$RUN_ID" --repo "$REPO" --log-failed > "$RAW_LOG" 2>/dev/null; then
+  : > "$RAW_LOG"
   echo "_Could not download the step logs. Run \`gh run view $RUN_ID --log-failed\` to see them._" >> "$EVIDENCE"
   echo "path=$EVIDENCE" >> "$GITHUB_OUTPUT"
   exit 0
 fi
 
-total=$(wc -l < "${RUNNER_TEMP}/raw.log")
+total=$(wc -l < "$RAW_LOG")
 
 # The first error line anchors the cause window. Fall back to the top when
 # nothing matches, which happens when a step dies without explaining itself.
-first_err=$(grep -nEi "$ERROR_RE" "${RUNNER_TEMP}/raw.log" 2>/dev/null | head -1 | cut -d: -f1 || true)
+first_err=$(grep -nEi "$ERROR_RE" "$RAW_LOG" 2>/dev/null | head -1 | cut -d: -f1 || true)
 [[ -z "$first_err" ]] && first_err=1
 
 half=$(( CONTEXT_LINES / 2 ))
@@ -65,14 +77,14 @@ end=$(( start + CONTEXT_LINES ))
 
   echo "### Where it first went wrong (line ${first_err})"
   echo '```'
-  sed -n "${start},${end}p" "${RUNNER_TEMP}/raw.log"
+  sed -n "${start},${end}p" "$RAW_LOG"
   echo '```'
   echo
 
   if (( total > end )); then
     echo "### How the job ended (last ${TAIL_LINES} lines)"
     echo '```'
-    tail -n "$TAIL_LINES" "${RUNNER_TEMP}/raw.log"
+    tail -n "$TAIL_LINES" "$RAW_LOG"
     echo '```'
   fi
 } >> "$EVIDENCE"
