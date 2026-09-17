@@ -86,7 +86,9 @@ jobs:
     name: Decide whether to attempt a fix
     runs-on: ubuntu-latest
     # Cheap gate. Nothing below costs anything unless a same-repo CI run really failed.
+    # Switched off 2026-09-17, too expensive: `false &&` skips all three jobs in every caller. Delete it to turn back on.
     if: >-
+      false &&
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.head_branch != ''

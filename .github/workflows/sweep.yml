@@ -22,6 +22,8 @@ permissions:
 
 jobs:
   sweep:
+    # Switched off 2026-09-17 along with autofix.yml: no point installing callers that skip. Delete to turn back on.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
