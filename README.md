@@ -161,8 +161,8 @@ failing log, with `Read`, `Glob` and `Grep` only — no shell, no editing tools 
 and is told to refute the fix. It ends with `VERDICT: APPROVE` or
 `VERDICT: REJECT — <why>` as its final line; anything else — no verdict, a
 verdict that is not the last line, more than one verdict, no transcript —
-counts as reject. The fixer is `claude-opus-5` and the
-reviewer `claude-sonnet-5` by default (`fixer_model` / `reviewer_model`): a
+counts as reject. The fixer is `claude-sonnet-5` and the
+reviewer `claude-haiku-4-5` by default (`fixer_model` / `reviewer_model`): a
 reviewer that shares the fixer's weights tends to find the fixer's reasoning
 persuasive, and the point of a second opinion is independent error. A read-only
 pass on the cheaper model is also a fraction of the cost.

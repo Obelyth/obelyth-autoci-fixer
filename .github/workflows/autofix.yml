@@ -60,18 +60,22 @@ on:
         type: number
         default: 150
       fixer_model:
-        description: "Model that diagnoses and edits."
+        description: >-
+          Model that diagnoses and edits. Sonnet 5 since 2026-09-18: Opus 5
+          was the whole of the workspace's Opus spend (one cortex run was 63
+          turns and 4.59 USD) and the honesty guard, not the model, is what
+          keeps a fix honest.
         type: string
-        default: "claude-opus-5"
+        default: "claude-sonnet-5"
       reviewer_model:
         description: >-
           Model that gives the second opinion. Deliberately a different model
           from the fixer: a reviewer that shares the fixer's weights tends to
           find the fixer's reasoning persuasive, and the point of a second
-          opinion is independent error. Sonnet 5 is also a fraction of the
+          opinion is independent error. Haiku 4.5 is also a fraction of the
           price for a read-only pass.
         type: string
-        default: "claude-sonnet-5"
+        default: "claude-haiku-4-5"
       test_command:
         description: "Command that runs the full check suite. Empty means auto-detect from the repo."
         type: string
