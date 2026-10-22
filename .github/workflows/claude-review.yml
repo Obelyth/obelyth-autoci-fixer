@@ -64,7 +64,7 @@ jobs:
 
       - name: Review PR
         id: review
-        uses: anthropics/claude-code-action@3b8197d3d486006dd4af54613517f21ac6ac625e # v1.0.227 (where v1 pointed on 2026-09-17)
+        uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.227 (where v1 pointed on 2026-09-17)
         with:
           # Subscription-billed. On Obelyth repositories this is the org secret (visibility: all
           # repositories); on ShootJackal repositories it is a repository secret. If the first run
